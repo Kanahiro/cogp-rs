@@ -129,6 +129,80 @@ The output file:
 - emits one or more row groups per level, written in coarse-to-fine order;
 - writes `cogp` metadata listing the `row_group_end` and `gsd` of each level.
 
+## Library use — reading COGP files
+
+The crate also exposes a `Reader` for reading COGP files from Rust. The reader
+hands back Arrow `RecordBatch`es with the geometry column kept in its on-disk
+WKB form, so downstream users plug in [`geozero`](https://crates.io/crates/geozero)
+(or any other WKB consumer) to convert into GeoJSON / WKT / `geo-types` /
+FlatGeobuf / etc.
+
+```toml
+[dependencies]
+cogp = "0.1"
+geozero = { version = "0.14", features = ["with-wkb"] }
+arrow-array = "56"
+```
+
+```rust
+use arrow_array::{Array, BinaryArray, LargeBinaryArray};
+use cogp::reader::Reader;
+use geozero::wkb::Wkb;
+use geozero::ToJson;
+
+let r = Reader::open("data.cogp.parquet")?;
+let primary = r.primary_column().to_string();
+
+// Progressive read: every level whose GSD is >= 1000 m (coarsest overviews).
+// Use `row_groups_up_to_level(i)` for level-based selection, or
+// `row_groups_intersecting_bbox([xmin, ymin, xmax, ymax])` for a spatial query.
+let rgs = r.row_groups_up_to_gsd(1000.0);
+let batches = r.into_batch_reader(rgs)?;
+
+for batch in batches {
+    let batch = batch?;
+    let geom = batch.column_by_name(&primary).unwrap();
+    if let Some(arr) = geom.as_any().downcast_ref::<BinaryArray>() {
+        for i in 0..arr.len() {
+            let geojson = Wkb(arr.value(i).to_vec()).to_json()?;
+            println!("{geojson}");
+        }
+    } else if let Some(arr) = geom.as_any().downcast_ref::<LargeBinaryArray>() {
+        for i in 0..arr.len() {
+            let geojson = Wkb(arr.value(i).to_vec()).to_json()?;
+            println!("{geojson}");
+        }
+    }
+}
+# Ok::<(), anyhow::Error>(())
+```
+
+Reader API at a glance:
+
+- `Reader::open(path)` / `Reader::try_new(reader)` — open a file or any
+  `parquet::file::reader::ChunkReader`.
+- `levels()`, `cogp_meta()`, `geo_meta()`, `primary_column()` — inspect metadata.
+- `row_groups_in_level(i)` — row groups belonging to a single level.
+- `row_groups_up_to_level(i)` — every level up to and including `i` (coarse → fine).
+- `row_groups_up_to_gsd(min_gsd)` — every level whose GSD is `>= min_gsd`.
+- `row_groups_intersecting_bbox([xmin, ymin, xmax, ymax])` — row groups whose
+  covering-bbox envelope intersects the query, using Parquet column statistics.
+- `into_batch_reader(rgs)` / `into_batch_reader_all()` — build the underlying
+  `ParquetRecordBatchReader`.
+
+Combine the row-group selectors with set intersection to do, e.g., "give me
+every feature in this bbox at zoom <= 8":
+
+```rust
+# use cogp::reader::Reader;
+# let r = Reader::open("data.cogp.parquet")?;
+let by_level: std::ops::Range<usize> = r.row_groups_up_to_level(8);
+let by_bbox: Vec<usize> = r.row_groups_intersecting_bbox([139.0, 35.0, 140.0, 36.0]);
+let rgs: Vec<usize> = by_bbox.into_iter().filter(|i| by_level.contains(i)).collect();
+let batches = r.into_batch_reader(rgs)?;
+# Ok::<(), anyhow::Error>(())
+```
+
 ## validate
 
 ```

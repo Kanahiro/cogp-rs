@@ -1,10 +1,6 @@
-mod convert;
-mod meta;
-mod validate;
-mod wkb_bbox;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use cogp::{convert, validate};
 use std::path::PathBuf;
 
 #[derive(Parser)]
