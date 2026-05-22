@@ -93,7 +93,12 @@ The output file:
 - writes a canonical `bbox` struct column (`xmin/ymin/xmax/ymax: f64`) and
   points GeoParquet 1.1 `covering.bbox` at it;
 - emits one or more row groups per level, written in coarse-to-fine order;
-- writes `cogp` metadata listing the `row_group_end` and `gsd` of each level.
+- writes `cogp` metadata listing the `row_group_end` and `gsd` of each level;
+- writes Parquet page-level statistics (ColumnIndex / OffsetIndex) on the
+  `bbox` struct's `xmin/ymin/xmax/ymax` child columns. Conformant writers
+  **SHOULD** emit these so that readers can prune at page granularity inside
+  each row group on spatial-range queries; row-group (chunk-level) statistics
+  on the same columns remain **REQUIRED** by SPEC §5.
 
 ## validate
 
