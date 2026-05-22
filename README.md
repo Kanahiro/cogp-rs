@@ -131,11 +131,16 @@ The output file:
 
 ## Library use — reading COGP files
 
-The crate also exposes a `Reader` for reading COGP files from Rust. The reader
-hands back Arrow `RecordBatch`es with the geometry column kept in its on-disk
-WKB form, so downstream users plug in [`geozero`](https://crates.io/crates/geozero)
-(or any other WKB consumer) to convert into GeoJSON / WKT / `geo-types` /
-FlatGeobuf / etc.
+The crate also exposes a `Reader` for reading COGP files from Rust. The
+Parquet footer (and the `geo` / `cogp` metadata it carries) is parsed
+**once** at construction; selectors take `&self` and never consume the
+reader, so a single `Reader` can sit in shared server state and fan out
+across requests. Geometries stay in their on-disk WKB form in the
+returned `RecordBatch`es — downstream users plug in
+[`geozero`](https://crates.io/crates/geozero) (or any other WKB consumer)
+to convert into GeoJSON / WKT / `geo-types` / FlatGeobuf / etc.
+
+### Local files (sync)
 
 ```toml
 [dependencies]
@@ -145,63 +150,118 @@ arrow-array = "56"
 ```
 
 ```rust
+use std::fs::File;
 use arrow_array::{Array, BinaryArray, LargeBinaryArray};
 use cogp::reader::Reader;
 use geozero::wkb::Wkb;
 use geozero::ToJson;
 
-let r = Reader::open("data.cogp.parquet")?;
-let primary = r.primary_column().to_string();
+// Footer is parsed here and cached. Hold this in app state and reuse it.
+let reader = Reader::open("data.cogp.parquet")?;
+let primary = reader.primary_column().to_string();
 
-// Progressive read: every level whose GSD is >= 1000 m (coarsest overviews).
-// Use `row_groups_up_to_level(i)` for level-based selection, or
-// `row_groups_intersecting_bbox([xmin, ymin, xmax, ymax])` for a spatial query.
-let rgs = r.row_groups_up_to_gsd(1000.0);
-let batches = r.into_batch_reader(rgs)?;
+// Pre-filter row groups using bbox stats + a target GSD/zoom — these
+// only read the cached footer, no Parquet IO.
+let by_bbox = reader.row_groups_intersecting_bbox([139.0, 35.0, 140.0, 36.0]);
+let by_level = reader.row_groups_up_to_level(8);
+let rgs: Vec<usize> = by_bbox.into_iter().filter(|i| by_level.contains(i)).collect();
+
+// Per request: open a fresh File and let the cached metadata drive the read.
+let file = File::open("data.cogp.parquet")?;
+let batches = reader.sync_batch_reader(file, &rgs)?;
 
 for batch in batches {
     let batch = batch?;
     let geom = batch.column_by_name(&primary).unwrap();
     if let Some(arr) = geom.as_any().downcast_ref::<BinaryArray>() {
         for i in 0..arr.len() {
-            let geojson = Wkb(arr.value(i).to_vec()).to_json()?;
-            println!("{geojson}");
+            println!("{}", Wkb(arr.value(i).to_vec()).to_json()?);
         }
     } else if let Some(arr) = geom.as_any().downcast_ref::<LargeBinaryArray>() {
         for i in 0..arr.len() {
-            let geojson = Wkb(arr.value(i).to_vec()).to_json()?;
-            println!("{geojson}");
+            println!("{}", Wkb(arr.value(i).to_vec()).to_json()?);
         }
     }
 }
 # Ok::<(), anyhow::Error>(())
 ```
 
-Reader API at a glance:
+### Remote files (async, S3 / GCS / HTTP)
 
-- `Reader::open(path)` / `Reader::try_new(reader)` — open a file or any
-  `parquet::file::reader::ChunkReader`.
-- `levels()`, `cogp_meta()`, `geo_meta()`, `primary_column()` — inspect metadata.
-- `row_groups_in_level(i)` — row groups belonging to a single level.
-- `row_groups_up_to_level(i)` — every level up to and including `i` (coarse → fine).
+Enable the `object_store` feature to pull only the row groups the request
+actually needs over HTTP range requests:
+
+```toml
+[dependencies]
+cogp = { version = "0.1", features = ["object_store"] }
+object_store = "0.11"
+geozero = { version = "0.14", features = ["with-wkb"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+```
+
+```rust,no_run
+# async fn run() -> anyhow::Result<()> {
+use std::sync::Arc;
+use cogp::reader::{Reader, ParquetObjectReader};
+use futures::StreamExt;
+use object_store::{aws::AmazonS3Builder, path::Path as ObjPath, ObjectStore};
+
+let store: Arc<dyn ObjectStore> =
+    Arc::new(AmazonS3Builder::from_env().with_bucket_name("my-bucket").build()?);
+let path = ObjPath::from("layers/admin.cogp.parquet");
+let head = store.head(&path).await?;
+
+// One range request for the footer, then cache it for the lifetime of the
+// server. Footer is never re-fetched, even across thousands of requests.
+let mut footer_reader = ParquetObjectReader::new(store.clone(), head.clone());
+let reader = Reader::try_new_async(&mut footer_reader).await?;
+let primary = reader.primary_column().to_string();
+
+// Per request: filter row groups (footer-only, no IO), then stream just
+// the bytes for those row groups. Both bbox and GSD/zoom are honored.
+let rgs: Vec<usize> = {
+    let by_bbox = reader.row_groups_intersecting_bbox([139.0, 35.0, 140.0, 36.0]);
+    let by_gsd = reader.row_groups_up_to_gsd(500.0);
+    by_bbox.into_iter().filter(|i| by_gsd.contains(i)).collect()
+};
+let per_request_reader = ParquetObjectReader::new(store.clone(), head.clone());
+let mut stream = reader.async_batch_stream(per_request_reader, &rgs)?;
+
+while let Some(batch) = stream.next().await {
+    let _batch = batch?;
+    // ... feed WKB column to geozero exactly as in the sync example.
+    let _ = &primary;
+}
+# Ok(()) }
+```
+
+### Reader API at a glance
+
+Construction (parses the footer once, then caches it):
+
+- `Reader::open(path)` — local file.
+- `Reader::try_new(reader)` — any `parquet::file::reader::ChunkReader`.
+- `Reader::try_new_async(reader)` — any
+  `parquet::arrow::async_reader::AsyncFileReader` (`feature = "async"`).
+- `Reader::from_arrow_metadata(meta)` — bring your own cached
+  `ArrowReaderMetadata`.
+
+Selectors (`&self`, no IO — they only consult the cached footer):
+
+- `levels()`, `cogp_meta()`, `geo_meta()`, `primary_column()`,
+  `num_row_groups()`, `parquet_metadata()`.
+- `row_groups_in_level(i)` — one level.
+- `row_groups_up_to_level(i)` — every level up to and including `i`.
 - `row_groups_up_to_gsd(min_gsd)` — every level whose GSD is `>= min_gsd`.
 - `row_groups_intersecting_bbox([xmin, ymin, xmax, ymax])` — row groups whose
-  covering-bbox envelope intersects the query, using Parquet column statistics.
-- `into_batch_reader(rgs)` / `into_batch_reader_all()` — build the underlying
-  `ParquetRecordBatchReader`.
+  covering-bbox envelope intersects the query, via Parquet column statistics.
 
-Combine the row-group selectors with set intersection to do, e.g., "give me
-every feature in this bbox at zoom <= 8":
+Per-request reads (hand in a fresh sync / async reader; footer is reused):
 
-```rust
-# use cogp::reader::Reader;
-# let r = Reader::open("data.cogp.parquet")?;
-let by_level: std::ops::Range<usize> = r.row_groups_up_to_level(8);
-let by_bbox: Vec<usize> = r.row_groups_intersecting_bbox([139.0, 35.0, 140.0, 36.0]);
-let rgs: Vec<usize> = by_bbox.into_iter().filter(|i| by_level.contains(i)).collect();
-let batches = r.into_batch_reader(rgs)?;
-# Ok::<(), anyhow::Error>(())
-```
+- `sync_batch_reader(reader, &row_groups)` — `ParquetRecordBatchReader`.
+- `async_batch_stream(reader, &row_groups)` — `ParquetRecordBatchStream`
+  (`feature = "async"`).
 
 ## validate
 
