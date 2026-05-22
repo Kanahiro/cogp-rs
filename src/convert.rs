@@ -11,7 +11,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::basic::ZstdLevel;
 use parquet::file::metadata::KeyValue;
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
@@ -487,13 +487,13 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let mut props_builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         .set_max_row_group_size(args.row_group_size)
-        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
+        .set_statistics_enabled(EnabledStatistics::Chunk)
         .set_column_dictionary_enabled(ColumnPath::from(geom_col_name.as_str()), false);
     for child in ["xmin", "ymin", "xmax", "ymax"] {
-        props_builder = props_builder.set_column_dictionary_enabled(
-            ColumnPath::from(vec!["bbox".to_string(), child.to_string()]),
-            false,
-        );
+        let path = ColumnPath::from(vec!["bbox".to_string(), child.to_string()]);
+        props_builder = props_builder
+            .set_column_dictionary_enabled(path.clone(), false)
+            .set_column_statistics_enabled(path, EnabledStatistics::Page);
     }
     let props = props_builder.build();
     let out_file = File::create(&args.output)
