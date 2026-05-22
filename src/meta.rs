@@ -10,20 +10,12 @@ pub const GEOPARQUET_VERSION: &str = "1.1.0";
 pub struct CogpMeta {
     pub version: String,
     pub levels: Vec<Level>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub generator: Option<Generator>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level {
     pub row_group_end: i64,
     pub gsd: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Generator {
-    pub name: String,
-    pub version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,11 +48,4 @@ pub struct BboxCovering {
     pub ymin: Vec<String>,
     pub xmax: Vec<String>,
     pub ymax: Vec<String>,
-}
-
-pub fn default_generator() -> Generator {
-    Generator {
-        name: "cogp".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    }
 }
