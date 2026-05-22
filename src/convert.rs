@@ -877,6 +877,13 @@ struct VisibilityFactors {
 /// Features whose bbox is smaller than `prec` are deferred to a finer level where they
 /// become independently meaningful — except Point-kind features which are always
 /// eligible from the coarsest level (they have no extent of their own).
+///
+/// Cells already occupied by a feature assigned at a coarser level are blocked: any
+/// remaining candidate whose center re-projects into such a cell at the current
+/// level's grid is skipped (it stays in `remaining` for a finer level). Without
+/// this, a tight cluster would surface one feature per level in the same visual
+/// neighborhood — a coarse winner plus near-identical fine winners around it.
+/// Blocking is per-kind because each kind uses its own grid pitch.
 fn assign_levels(
     bboxes: &[Bbox],
     kinds: &[GeomKind],
@@ -950,7 +957,35 @@ fn assign_levels(
         })
         .collect();
 
+    let eff_prec = |k: GeomKind, prec: f64| -> f64 {
+        match k {
+            GeomKind::Point => prec * point_thin_mul,
+            GeomKind::Line => prec * line_thin_mul,
+            GeomKind::Polygon => prec * polygon_thin_mul,
+        }
+    };
+    let cell_key = |row: u32, prec: f64| -> (u8, i64, i64) {
+        let b = bboxes[row as usize];
+        let k = kinds[row as usize];
+        let ep = eff_prec(k, prec);
+        (
+            k as u8,
+            (b.cx() / ep).floor() as i64,
+            (b.cy() / ep).floor() as i64,
+        )
+    };
+
+    let mut assigned_so_far: Vec<u32> = Vec::new();
     for (level_i, prec) in precs.iter().enumerate() {
+        // Re-project every coarser-level feature onto this level's grid and
+        // mark those cells as blocked, so a candidate falling into the same
+        // (kind, ix, iy) cell as an already-placed coarse winner is skipped.
+        // Rebuilt per level because each level's grid pitch differs.
+        let blocked: std::collections::HashSet<(u8, i64, i64)> = assigned_so_far
+            .par_iter()
+            .map(|&row| cell_key(row, *prec))
+            .collect();
+
         // Per-cell winner map built in parallel: each thread folds into a local
         // HashMap, then reduce merges them keeping the higher-priority row on
         // collision. The key is `(kind, ix, iy)` — kind-tagged because each
@@ -962,18 +997,10 @@ fn assign_levels(
                 if min_visible[row as usize] as usize > level_i {
                     return local;
                 }
-                let b = bboxes[row as usize];
-                let k = kinds[row as usize];
-                let eff_prec = match k {
-                    GeomKind::Point => prec * point_thin_mul,
-                    GeomKind::Line => prec * line_thin_mul,
-                    GeomKind::Polygon => prec * polygon_thin_mul,
-                };
-                let key = (
-                    k as u8,
-                    (b.cx() / eff_prec).floor() as i64,
-                    (b.cy() / eff_prec).floor() as i64,
-                );
+                let key = cell_key(row, *prec);
+                if blocked.contains(&key) {
+                    return local;
+                }
                 match local.get(&key) {
                     None => {
                         local.insert(key, row);
@@ -1012,6 +1039,7 @@ fn assign_levels(
         for r in &picked {
             assigned[*r as usize] = level_i as i32;
         }
+        assigned_so_far.extend(picked.iter().copied());
         let picked_set: std::collections::HashSet<u32> = picked.iter().copied().collect();
         remaining.retain(|r| !picked_set.contains(r));
         if remaining.is_empty() {
