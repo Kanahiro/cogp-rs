@@ -8,22 +8,42 @@ license = "CC-BY-4.0"
 [[bin]]
 name = "cogp"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-arrow = "56"
-arrow-array = "56"
-arrow-buffer = "56"
-arrow-schema = "56"
-parquet = { version = "56", default-features = false, features = ["arrow", "snap", "zstd", "brotli", "lz4"] }
+parquet = { version = "56", default-features = false, features = ["arrow", "snap", "brotli", "lz4"] }
 byteorder = "1"
-rayon = "1"
+
+# CLI / writer path — only needed to run `cogp convert` (and as deps the
+# convert module pulls in). Optional so the Reader-only library is buildable
+# for targets where these don't apply (e.g. wasm32-unknown-unknown).
+arrow = { version = "56", optional = true }
+arrow-array = { version = "56", optional = true }
+arrow-buffer = { version = "56", optional = true }
+arrow-schema = { version = "56", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+rayon = { version = "1", optional = true }
 
 [features]
-default = []
+default = ["cli"]
+# Enables the `cogp` binary and the `convert` module (parallel writer based on
+# rayon + arrow). Required to build the bin target.
+cli = [
+    "dep:arrow",
+    "dep:arrow-array",
+    "dep:arrow-buffer",
+    "dep:arrow-schema",
+    "dep:clap",
+    "dep:rayon",
+    "zstd",
+]
+# Zstd compression for Parquet. Pulls in `zstd-sys` (C) which does not build
+# out of the box for `wasm32-unknown-unknown`. On WASM, leave this off and
+# author COGP files with snap/brotli/lz4 if you need to read them in-browser.
+zstd = ["parquet/zstd"]
 # Async reader path: enables `Reader::try_new_async` and `async_batch_stream` on top
 # of `parquet::arrow::async_reader::AsyncFileReader` — bring your own runtime.
 async = ["parquet/async"]

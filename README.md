@@ -263,6 +263,48 @@ Per-request reads (hand in a fresh sync / async reader; footer is reused):
 - `async_batch_stream(reader, &row_groups)` — `ParquetRecordBatchStream`
   (`feature = "async"`).
 
+### Cargo features
+
+| Feature        | Default | Pulls in                                  | What it enables                                                |
+| -------------- | ------- | ----------------------------------------- | -------------------------------------------------------------- |
+| `cli`          | ✅      | `arrow`, `clap`, `rayon`, `zstd`          | `cogp` binary + `convert` module (parallel writer).            |
+| `zstd`         | via cli | `zstd-sys` (C)                            | Read/write zstd-compressed Parquet pages.                      |
+| `async`        |         | `parquet/async` (`futures`, `tokio`)      | `Reader::try_new_async`, `async_batch_stream`.                 |
+| `object_store` |         | above + `parquet/object_store`            | Re-exports `ParquetObjectReader` for S3/GCS/HTTP.              |
+
+### WASM build (`wasm32-unknown-unknown`)
+
+The `cli` feature pulls in `rayon` (needs threads) and the `zstd` feature
+pulls in `zstd-sys` (a C library) — neither builds for
+`wasm32-unknown-unknown` out of the box. Build the lib without those:
+
+```bash
+# Reader-only, sync (Bytes / custom ChunkReader)
+cargo build --target wasm32-unknown-unknown --no-default-features --lib
+
+# Reader-only, async (bring your own AsyncFileReader, e.g. browser fetch)
+cargo build --target wasm32-unknown-unknown --no-default-features --features async --lib
+```
+
+In a browser, implement
+[`parquet::arrow::async_reader::AsyncFileReader`](https://docs.rs/parquet/latest/parquet/arrow/async_reader/trait.AsyncFileReader.html)
+on top of `web_sys::Request` / `fetch` (using HTTP `Range` headers) and pass
+it to `Reader::try_new_async` / `async_batch_stream`. The footer fetch is one
+range request; subsequent requests pull only the row-group byte ranges
+returned by `row_groups_intersecting_bbox` / `row_groups_up_to_gsd`.
+
+Caveats:
+
+- The `object_store` feature is not WASM-supported here — its AWS / GCP
+  backends bring native HTTP stacks that don't link on
+  `wasm32-unknown-unknown`. Roll your own `AsyncFileReader` against
+  `fetch` instead.
+- Without the `zstd` feature, reading **zstd-compressed** Parquet pages
+  fails at runtime. Re-author affected files with `--row-group-size`
+  unchanged but a snap/brotli/lz4 codec, or run the conversion on a
+  non-WASM host.
+- `rayon` is `cli`-only; the Reader itself never spawns threads.
+
 ## validate
 
 ```
