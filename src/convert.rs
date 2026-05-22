@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::meta::{
-    default_generator, BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, Level,
-    COGP_METADATA_KEY, COGP_VERSION, GEOPARQUET_VERSION, GEO_METADATA_KEY,
+    BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, Level, COGP_METADATA_KEY, COGP_VERSION,
+    GEOPARQUET_VERSION, GEO_METADATA_KEY,
 };
 use crate::wkb_bbox::{bbox_from_wkb, kind_from_wkb, Bbox, GeomKind};
 
@@ -597,7 +597,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let cogp_meta = CogpMeta {
         version: COGP_VERSION.to_string(),
         levels: levels_meta,
-        generator: Some(default_generator()),
     };
 
     writer.append_key_value_metadata(KeyValue {
