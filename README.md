@@ -278,3 +278,32 @@ Checks SPEC §5:
 - `gsd` values are positive and strictly decreasing.
 
 Exits non-zero on failure.
+
+## Benchmarks
+
+`tools/bench_cogp.py` compares two `cogp` binaries on the same input
+GeoParquet file. It measures conversion time, output size, row-group bbox
+area/aspect ratio, bbox-query hit row groups, compressed bytes selected, and
+row-group index continuity.
+
+Install the Python analysis dependency:
+
+```
+python3 -m pip install -r tools/requirements-bench.txt
+```
+
+Example comparing a `main` worktree binary with the current branch:
+
+```
+tools/bench_cogp.py \
+  --input /Users/kanahiro/Downloads/foss4ghkd/building.parquet \
+  --baseline-bin /tmp/cogp-rs-main-bench/target/release/cogp \
+  --candidate-bin target/release/cogp \
+  --baseline-label main \
+  --candidate-label current \
+  --json-out /tmp/cogp-bench/building.json \
+  --markdown-out /tmp/cogp-bench/building.md
+```
+
+Use `--reuse-outputs` with `--baseline-output` / `--candidate-output` to
+reanalyze existing converted files without rerunning `convert`.
