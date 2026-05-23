@@ -443,8 +443,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         );
     }
 
-    for rows in per_level.iter_mut() {
-        str_pack(rows, &bboxes, args.row_group_size);
+    for (level_idx, rows) in per_level.iter_mut().enumerate() {
+        str_pack(rows, &bboxes, args.row_group_size, level_idx);
     }
 
     eprintln!("[4/4] Writing COGP file: {}", args.output.display());
@@ -1081,46 +1081,121 @@ fn priority(b: &Bbox, row: u32) -> (u64, u64) {
     (sq_bits, hash)
 }
 
-/// Sort-Tile-Recursive packing: divide into ~sqrt(N/M) strips by center-x, then sort by
-/// center-y inside each strip with boustrophedon (alternating direction across strips).
-fn str_pack(rows: &mut Vec<u32>, bboxes: &[Bbox], row_group_size: usize) {
+/// Per-axis sort direction inherited down the recursion tree.
+#[derive(Clone, Copy)]
+struct SortDir {
+    rev_x: bool,
+    rev_y: bool,
+}
+
+impl SortDir {
+    /// Whether the sort along `axis` should be descending.
+    fn reverse_on(self, split_x: bool) -> bool {
+        if split_x { self.rev_x } else { self.rev_y }
+    }
+
+    /// Right-child direction: flip the *other* axis so the right subtree's
+    /// next split along that axis runs in reverse, making the right
+    /// subtree's first leaf land next to the left subtree's last leaf.
+    fn flip_for_right_child(self, split_x: bool) -> Self {
+        if split_x {
+            Self { rev_x: self.rev_x, rev_y: !self.rev_y }
+        } else {
+            Self { rev_x: !self.rev_x, rev_y: self.rev_y }
+        }
+    }
+}
+
+/// Corner the snake traversal starts from at the root of a level.
+#[derive(Clone, Copy)]
+enum SnakeStart {
+    /// (low x, high y) — even levels.
+    TopLeft,
+    /// (high x, low y) — odd levels; reverses the previous level's exit.
+    BottomRight,
+}
+
+impl SnakeStart {
+    fn for_level(level_idx: usize) -> Self {
+        if level_idx % 2 == 0 { Self::TopLeft } else { Self::BottomRight }
+    }
+
+    fn initial_dir(self) -> SortDir {
+        match self {
+            Self::TopLeft => SortDir { rev_x: false, rev_y: true },
+            Self::BottomRight => SortDir { rev_x: true, rev_y: false },
+        }
+    }
+}
+
+/// Recursive STR bulk-loading with boustrophedon (snake) leaf ordering.
+/// Splits the longer extent axis at a row-group boundary at each step. The
+/// snake's starting corner alternates per `level_idx`, so adjacent COGP
+/// levels enter/exit on the same side and read order stays spatially local.
+fn str_pack(rows: &mut Vec<u32>, bboxes: &[Bbox], row_group_size: usize, level_idx: usize) {
+    let dir = SnakeStart::for_level(level_idx).initial_dir();
+    // Shared scratch buffer for DSU sorting; sliced (never reallocated) as
+    // recursion descends, so total allocation is O(N) once.
+    let mut scratch: Vec<(f64, u32)> = vec![(0.0, 0); rows.len()];
+    str_pack_rec(rows.as_mut_slice(), &mut scratch, bboxes, row_group_size, dir);
+}
+
+fn str_pack_rec(
+    rows: &mut [u32],
+    scratch: &mut [(f64, u32)],
+    bboxes: &[Bbox],
+    m: usize,
+    dir: SortDir,
+) {
     let n = rows.len();
-    if n <= row_group_size {
-        rows.par_sort_by(|a, b| {
-            bboxes[*a as usize]
-                .cx()
-                .partial_cmp(&bboxes[*b as usize].cx())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+    if n <= m {
         return;
     }
-    let m = row_group_size as f64;
-    let strips = (((n as f64) / m).sqrt().round() as usize).max(1);
-    let strip_size = (strips * row_group_size).max(row_group_size);
-    rows.par_sort_by(|a, b| {
-        bboxes[*a as usize]
-            .cx()
-            .partial_cmp(&bboxes[*b as usize].cx())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    // Each strip is sorted by center-y independently → parallel across strips.
-    rows.par_chunks_mut(strip_size)
-        .enumerate()
-        .for_each(|(strip_id, slice)| {
-            if strip_id % 2 == 0 {
-                slice.sort_by(|a, b| {
-                    bboxes[*a as usize]
-                        .cy()
-                        .partial_cmp(&bboxes[*b as usize].cy())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            } else {
-                slice.sort_by(|a, b| {
-                    bboxes[*b as usize]
-                        .cy()
-                        .partial_cmp(&bboxes[*a as usize].cy())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
+    let extent = rows
+        .par_iter()
+        .fold(Bbox::empty, |mut acc, i| {
+            acc.merge(&bboxes[*i as usize]);
+            acc
+        })
+        .reduce(Bbox::empty, |mut a, b| {
+            a.merge(&b);
+            a
         });
+    let split_x = extent.width() >= extent.height();
+    let reverse = dir.reverse_on(split_x);
+
+    // Decorate-Sort-Undecorate: stage (key, row_idx) pairs once, sort by
+    // key, then write the reordered row indices back. The sort comparator
+    // touches only the local scratch buffer instead of doing O(n log n)
+    // random reads into `bboxes`.
+    scratch
+        .par_iter_mut()
+        .zip(rows.par_iter())
+        .for_each(|(slot, i)| {
+            let b = &bboxes[*i as usize];
+            let key = if split_x { b.cx() } else { b.cy() };
+            *slot = (key, *i);
+        });
+    scratch.par_sort_unstable_by(|a, b| {
+        let ord = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
+        if reverse { ord.reverse() } else { ord }
+    });
+    rows.par_iter_mut()
+        .zip(scratch.par_iter())
+        .for_each(|(r, (_, i))| {
+            *r = *i;
+        });
+
+    // Split on a row-group boundary so every leaf is fully packed at M
+    // (only the very last leaf in the level may be partial).
+    let num_leaves = n.div_ceil(m);
+    let left_leaves = (num_leaves / 2).max(1);
+    let split_at = left_leaves * m;
+    let (left_rows, right_rows) = rows.split_at_mut(split_at);
+    let (left_scratch, right_scratch) = scratch.split_at_mut(split_at);
+    let right_dir = dir.flip_for_right_child(split_x);
+    rayon::join(
+        || str_pack_rec(left_rows, left_scratch, bboxes, m, dir),
+        || str_pack_rec(right_rows, right_scratch, bboxes, m, right_dir),
+    );
 }
