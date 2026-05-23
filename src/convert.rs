@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, Float64Array, LargeBinaryArray, RecordBatch, StructArray,
-    UInt32Array,
+    Array, ArrayRef, BinaryArray, Float64Array, LargeBinaryArray, RecordBatch, StringArray,
+    StructArray, UInt32Array,
 };
 use arrow::compute::{cast, concat_batches, take};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -376,11 +376,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
 
     // arrow's GenericBytesBuilder<i32> panics with "byte array offset overflow"
-    // once cumulative bytes exceed i32::MAX (~2 GiB). With polygon-heavy inputs
-    // a Binary geometry column easily crosses that line during concat_batches.
-    // Upcast to LargeBinary (i64 offsets) when the total would overflow.
-    let (input_batches, input_schema) =
-        upcast_geom_if_needed(input_batches, input_schema, geom_col_idx, &geom_col_name)?;
+    // once cumulative bytes exceed i32::MAX (~2 GiB). `concat_batches` walks
+    // every column independently, so a panic can come from the geometry column
+    // *or* any sufficiently large attribute column (e.g. addresses on a
+    // country-scale building dataset). Upcast every Binary/Utf8 column that
+    // crosses the threshold to its i64-offset counterpart.
+    let (input_batches, input_schema) = upcast_large_offsets_if_needed(input_batches, input_schema)?;
     let table: RecordBatch = concat_batches(&input_schema, &input_batches)?;
     let n_rows = table.num_rows();
     eprintln!("      features: {n_rows}");
@@ -666,45 +667,65 @@ fn build_bbox_struct(bboxes: &[Bbox]) -> Result<StructArray> {
     )?)
 }
 
-/// If the geometry column is Binary (i32 offsets) and the combined WKB bytes
-/// across batches would overflow i32 during `concat_batches`, upcast it to
-/// LargeBinary (i64 offsets). Returns the (possibly rewritten) batches and the
-/// matching schema. A 1 GiB threshold leaves headroom for arrow's internal
-/// rounding and keeps small datasets on the cheaper Binary path.
-fn upcast_geom_if_needed(
+/// Promote every top-level `Binary`/`Utf8` column whose accumulated bytes
+/// across batches would overflow i32 offsets during `concat_batches` to its
+/// `Large` counterpart (i64 offsets). Each batch is cast independently — the
+/// per-batch arrays were just produced by the parquet reader, so they are
+/// already within the i32 budget; the overflow only manifests when arrow tries
+/// to combine them. A 1 GiB per-column threshold leaves headroom for arrow's
+/// internal rounding and keeps small datasets on the cheaper i32 path.
+fn upcast_large_offsets_if_needed(
     batches: Vec<RecordBatch>,
     schema: Arc<Schema>,
-    geom_col_idx: usize,
-    geom_col_name: &str,
 ) -> Result<(Vec<RecordBatch>, Arc<Schema>)> {
-    if !matches!(schema.field(geom_col_idx).data_type(), DataType::Binary) {
+    const PROMOTE_THRESHOLD: usize = 1 << 30;
+
+    let mut promote: Vec<(usize, DataType)> = Vec::new();
+    for (i, field) in schema.fields().iter().enumerate() {
+        let large = match field.data_type() {
+            DataType::Binary => DataType::LargeBinary,
+            DataType::Utf8 => DataType::LargeUtf8,
+            _ => continue,
+        };
+        let total: usize = batches
+            .iter()
+            .map(|b| {
+                let arr = b.column(i);
+                match arr.data_type() {
+                    DataType::Binary => arr
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .map(|a| a.value_data().len())
+                        .unwrap_or(0),
+                    DataType::Utf8 => arr
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .map(|a| a.value_data().len())
+                        .unwrap_or(0),
+                    _ => 0,
+                }
+            })
+            .sum();
+        if total >= PROMOTE_THRESHOLD {
+            eprintln!(
+                "      column `{}` is {} bytes — upcasting {:?} → {:?} to avoid i32 offset overflow",
+                field.name(),
+                total,
+                field.data_type(),
+                large,
+            );
+            promote.push((i, large));
+        }
+    }
+    if promote.is_empty() {
         return Ok((batches, schema));
     }
-    let total: usize = batches
-        .iter()
-        .map(|b| {
-            b.column(geom_col_idx)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .map(|a| a.value_data().len())
-                .unwrap_or(0)
-        })
-        .sum();
-    if total < 1 << 30 {
-        return Ok((batches, schema));
-    }
-    eprintln!(
-        "      geometry column `{geom_col_name}` is {} bytes — upcasting Binary → LargeBinary to avoid i32 offset overflow",
-        total
-    );
     let mut new_fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
-    let old_field = &new_fields[geom_col_idx];
-    new_fields[geom_col_idx] = Field::new(
-        old_field.name(),
-        DataType::LargeBinary,
-        old_field.is_nullable(),
-    )
-    .with_metadata(old_field.metadata().clone());
+    for (idx, large) in &promote {
+        let old = &new_fields[*idx];
+        new_fields[*idx] = Field::new(old.name(), large.clone(), old.is_nullable())
+            .with_metadata(old.metadata().clone());
+    }
     let new_schema = Arc::new(Schema::new_with_metadata(
         new_fields,
         schema.metadata().clone(),
@@ -713,7 +734,9 @@ fn upcast_geom_if_needed(
         .into_iter()
         .map(|b| -> Result<RecordBatch> {
             let mut cols: Vec<ArrayRef> = b.columns().to_vec();
-            cols[geom_col_idx] = cast(cols[geom_col_idx].as_ref(), &DataType::LargeBinary)?;
+            for (idx, large) in &promote {
+                cols[*idx] = cast(cols[*idx].as_ref(), large)?;
+            }
             Ok(RecordBatch::try_new(new_schema.clone(), cols)?)
         })
         .collect::<Result<Vec<_>>>()?;
