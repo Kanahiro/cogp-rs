@@ -282,3 +282,174 @@ fn parse_cogp_kv(metadata: &Arc<ParquetMetaData>) -> Result<(GeoMeta, CogpMeta)>
         .map_err(|e| anyhow!("`cogp` metadata is not valid JSON: {e}"))?;
     Ok((geo_meta, cogp_meta))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::{
+        BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, COGP_VERSION, GEOPARQUET_VERSION,
+    };
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::metadata::KeyValue;
+    use std::collections::BTreeMap;
+
+    fn level(row_group_end: i64, gsd: f64) -> Level {
+        Level { row_group_end, gsd }
+    }
+
+    /// Construct a `Reader` whose footer carries the supplied COGP levels.
+    /// The Arrow schema and row-group count are minimal — only the selector
+    /// tests below read them. The construction path itself goes through the
+    /// real `from_arrow_metadata`, so the metadata-parse code runs as well.
+    fn reader_with_levels(levels: Vec<Level>) -> Reader {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+            let mut cols = BTreeMap::new();
+            cols.insert(
+                "geometry".to_string(),
+                GeoColumn {
+                    encoding: "WKB".into(),
+                    geometry_types: vec![],
+                    covering: Some(Covering {
+                        bbox: BboxCovering {
+                            xmin: vec!["bbox".into(), "xmin".into()],
+                            ymin: vec!["bbox".into(), "ymin".into()],
+                            xmax: vec!["bbox".into(), "xmax".into()],
+                            ymax: vec!["bbox".into(), "ymax".into()],
+                        },
+                    }),
+                    bbox: None,
+                    crs: None,
+                },
+            );
+            let geo = GeoMeta {
+                version: GEOPARQUET_VERSION.into(),
+                primary_column: "geometry".into(),
+                columns: cols,
+            };
+            let cogp = CogpMeta {
+                version: COGP_VERSION.into(),
+                levels,
+            };
+            w.append_key_value_metadata(KeyValue {
+                key: GEO_METADATA_KEY.into(),
+                value: Some(serde_json::to_string(&geo).unwrap()),
+            });
+            w.append_key_value_metadata(KeyValue {
+                key: COGP_METADATA_KEY.into(),
+                value: Some(serde_json::to_string(&cogp).unwrap()),
+            });
+            w.close().unwrap();
+        }
+        Reader::try_new(bytes::Bytes::from(buf)).unwrap()
+    }
+
+    #[test]
+    fn row_groups_in_level_boundaries() {
+        let r = reader_with_levels(vec![level(1, 1000.0), level(4, 100.0), level(9, 10.0)]);
+        assert_eq!(r.row_groups_in_level(0).unwrap(), 0..2);
+        assert_eq!(r.row_groups_in_level(1).unwrap(), 2..5);
+        assert_eq!(r.row_groups_in_level(2).unwrap(), 5..10);
+        assert!(r.row_groups_in_level(3).is_none());
+    }
+
+    #[test]
+    fn row_groups_up_to_level_clamps_and_inclusive() {
+        let r = reader_with_levels(vec![level(1, 1000.0), level(4, 100.0), level(9, 10.0)]);
+        assert_eq!(r.row_groups_up_to_level(0), 0..2);
+        assert_eq!(r.row_groups_up_to_level(1), 0..5);
+        assert_eq!(r.row_groups_up_to_level(2), 0..10);
+        // Out-of-range index clamps to the finest level rather than panicking.
+        assert_eq!(r.row_groups_up_to_level(999), 0..10);
+    }
+
+    #[test]
+    fn row_groups_up_to_level_empty_when_no_levels() {
+        let r = reader_with_levels(vec![]);
+        assert!(r.row_groups_up_to_level(0).is_empty());
+    }
+
+    #[test]
+    fn row_groups_up_to_gsd_picks_last_level_above_target() {
+        let r = reader_with_levels(vec![level(1, 1000.0), level(4, 100.0), level(9, 10.0)]);
+        // target finer than every level → include every level
+        assert_eq!(r.row_groups_up_to_gsd(1.0), 0..10);
+        // target equal to the finest level GSD → include every level
+        assert_eq!(r.row_groups_up_to_gsd(10.0), 0..10);
+        // target between levels 1 and 2 → cut off after level 1
+        assert_eq!(r.row_groups_up_to_gsd(50.0), 0..5);
+        // target finer than the coarsest only
+        assert_eq!(r.row_groups_up_to_gsd(500.0), 0..2);
+        // target coarser than every level → empty
+        assert!(r.row_groups_up_to_gsd(1e9).is_empty());
+    }
+
+    /// Build a tiny parquet `bytes::Bytes` blob with the given KV metadata
+    /// entries and return the reader-construction result.
+    fn try_open_with_kv(kv: Vec<KeyValue>) -> Result<Reader> {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let mut buf: Vec<u8> = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        for e in kv {
+            w.append_key_value_metadata(e);
+        }
+        w.close().unwrap();
+        Reader::try_new(bytes::Bytes::from(buf))
+    }
+
+    #[test]
+    fn parse_cogp_kv_rejects_missing_geo() {
+        let cogp = CogpMeta {
+            version: COGP_VERSION.into(),
+            levels: vec![],
+        };
+        let err = try_open_with_kv(vec![KeyValue {
+            key: COGP_METADATA_KEY.into(),
+            value: Some(serde_json::to_string(&cogp).unwrap()),
+        }])
+        .err()
+        .expect("expected reader construction to fail");
+        assert!(format!("{err}").contains("geo"), "{err}");
+    }
+
+    #[test]
+    fn parse_cogp_kv_rejects_missing_cogp() {
+        let mut cols = BTreeMap::new();
+        cols.insert(
+            "geometry".to_string(),
+            GeoColumn {
+                encoding: "WKB".into(),
+                geometry_types: vec![],
+                covering: None,
+                bbox: None,
+                crs: None,
+            },
+        );
+        let geo = GeoMeta {
+            version: GEOPARQUET_VERSION.into(),
+            primary_column: "geometry".into(),
+            columns: cols,
+        };
+        let err = try_open_with_kv(vec![KeyValue {
+            key: GEO_METADATA_KEY.into(),
+            value: Some(serde_json::to_string(&geo).unwrap()),
+        }])
+        .err()
+        .expect("expected reader construction to fail");
+        assert!(format!("{err}").contains("cogp"), "{err}");
+    }
+
+    #[test]
+    fn parse_cogp_kv_rejects_malformed_geo_json() {
+        let err = try_open_with_kv(vec![KeyValue {
+            key: GEO_METADATA_KEY.into(),
+            value: Some("{not valid json".into()),
+        }])
+        .err()
+        .expect("expected reader construction to fail");
+        assert!(format!("{err}").contains("geo"), "{err}");
+    }
+}

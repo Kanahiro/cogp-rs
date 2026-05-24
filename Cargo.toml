@@ -9,6 +9,9 @@ license = "CC-BY-4.0"
 name = "cogp"
 path = "src/main.rs"
 
+[dev-dependencies]
+bytes = "1"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

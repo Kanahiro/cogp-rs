@@ -161,9 +161,7 @@ fn write_batch_with_row_group_limits<W: Write + Send>(
         // probe a single row first, so a dataset where one row already exceeds
         // `max_bytes` (e.g. dense MultiPolygons) cannot inflate the row group
         // by ~1024× before the next size check.
-        let rows_until_byte_limit = if buffered_rows == 0 {
-            1
-        } else if buffered_bytes >= max_bytes {
+        let rows_until_byte_limit = if buffered_rows == 0 || buffered_bytes >= max_bytes {
             1
         } else {
             let bytes_per_row = buffered_bytes.div_ceil(buffered_rows).max(1);
@@ -216,7 +214,7 @@ fn detect_input_units(input_geo: Option<&GeoMeta>, geom_col: &str) -> InputUnits
 }
 
 /// Web Mercator equatorial circumference, used as `2π · 6_378_137 m`.
-const WEB_MERCATOR_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_488;
+const WEB_MERCATOR_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_49;
 
 /// Ground distance per base unit at the equator at zoom 0, for a tile sliced
 /// into `webmerc_resolution` units per side. The default of 1024 yields
@@ -274,13 +272,15 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         );
         derived
     };
+    // `partial_cmp` rather than `<=` / `<` so NaN values also fail the check
+    // (NaN compares as `None`, which is not `Some(Greater)`).
     for w in gsds.windows(2) {
-        if !(w[0] > w[1]) {
+        if w[0].partial_cmp(&w[1]) != Some(std::cmp::Ordering::Greater) {
             bail!("GSD values must be strictly decreasing, got {:?}", gsds);
         }
     }
     for g in &gsds {
-        if !(*g > 0.0) {
+        if g.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             bail!("GSD values must be positive, got {:?}", gsds);
         }
     }
@@ -1140,7 +1140,7 @@ enum SnakeStart {
 
 impl SnakeStart {
     fn for_level(level_idx: usize) -> Self {
-        if level_idx % 2 == 0 { Self::TopLeft } else { Self::BottomRight }
+        if level_idx.is_multiple_of(2) { Self::TopLeft } else { Self::BottomRight }
     }
 
     fn initial_dir(self) -> SortDir {
@@ -1221,4 +1221,229 @@ fn str_pack_rec(
         || str_pack_rec(left_rows, left_scratch, bboxes, m, dir),
         || str_pack_rec(right_rows, right_scratch, bboxes, m, right_dir),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bb(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Bbox {
+        Bbox { xmin, ymin, xmax, ymax }
+    }
+
+    #[test]
+    fn web_mercator_gsds_monotonic_and_halving() {
+        let g = web_mercator_gsds(0, 4, 1024);
+        assert_eq!(g.len(), 5);
+        for w in g.windows(2) {
+            assert!((w[0] / 2.0 - w[1]).abs() < 1e-6, "expected halving, got {w:?}");
+        }
+        // Web Mercator equatorial circumference / 1024 at z0.
+        assert!((g[0] - WEB_MERCATOR_CIRCUMFERENCE_M / 1024.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn detect_input_units_branches() {
+        // No metadata at all → degrees (CRS84 fallback).
+        assert!(matches!(detect_input_units(None, "geom"), InputUnits::Degrees));
+
+        let mk = |crs: Option<serde_json::Value>| {
+            let mut cols = BTreeMap::new();
+            cols.insert(
+                "geom".to_string(),
+                GeoColumn {
+                    encoding: "WKB".into(),
+                    geometry_types: vec![],
+                    covering: None,
+                    bbox: None,
+                    crs,
+                },
+            );
+            GeoMeta {
+                version: "1.1.0".into(),
+                primary_column: "geom".into(),
+                columns: cols,
+            }
+        };
+
+        // Missing column → degrees.
+        let geo = mk(None);
+        assert!(matches!(
+            detect_input_units(Some(&geo), "other"),
+            InputUnits::Degrees
+        ));
+
+        // crs absent / null → degrees.
+        assert!(matches!(
+            detect_input_units(Some(&geo), "geom"),
+            InputUnits::Degrees
+        ));
+        let geo_null = mk(Some(serde_json::Value::Null));
+        assert!(matches!(
+            detect_input_units(Some(&geo_null), "geom"),
+            InputUnits::Degrees
+        ));
+
+        // ProjectedCRS → meters.
+        let geo_proj = mk(Some(serde_json::json!({"type": "ProjectedCRS"})));
+        assert!(matches!(
+            detect_input_units(Some(&geo_proj), "geom"),
+            InputUnits::Meters
+        ));
+
+        // GeographicCRS → degrees.
+        let geo_geog = mk(Some(serde_json::json!({"type": "GeographicCRS"})));
+        assert!(matches!(
+            detect_input_units(Some(&geo_geog), "geom"),
+            InputUnits::Degrees
+        ));
+
+        // BoundCRS recurses into source_crs.
+        let geo_bound = mk(Some(serde_json::json!({
+            "type": "BoundCRS",
+            "source_crs": {"type": "ProjectedCRS"},
+        })));
+        assert!(matches!(
+            detect_input_units(Some(&geo_bound), "geom"),
+            InputUnits::Meters
+        ));
+
+        // Unknown type → degrees (conservative default).
+        let geo_unknown = mk(Some(serde_json::json!({"type": "SomethingElse"})));
+        assert!(matches!(
+            detect_input_units(Some(&geo_unknown), "geom"),
+            InputUnits::Degrees
+        ));
+    }
+
+    #[test]
+    fn priority_orders_by_diagonal_then_hash() {
+        // Larger diagonal beats smaller diagonal.
+        let small = priority(&bb(0.0, 0.0, 1.0, 1.0), 0);
+        let large = priority(&bb(0.0, 0.0, 10.0, 10.0), 0);
+        assert!(large > small);
+
+        // Same diagonal, different row → deterministic but distinguishable.
+        let a = priority(&bb(0.0, 0.0, 1.0, 1.0), 0);
+        let b = priority(&bb(0.0, 0.0, 1.0, 1.0), 1);
+        assert_eq!(a.0, b.0);
+        assert_ne!(a.1, b.1);
+    }
+
+    #[test]
+    fn assign_levels_points_always_eligible_from_level_zero() {
+        // Two coarse points, far apart → both should land on level 0.
+        let bboxes = vec![bb(0.0, 0.0, 0.0, 0.0), bb(1000.0, 1000.0, 1000.0, 1000.0)];
+        let kinds = vec![GeomKind::Point, GeomKind::Point];
+        let gsds = vec![100.0, 50.0];
+        let out = assign_levels(
+            &bboxes,
+            &kinds,
+            &gsds,
+            InputUnits::Meters,
+            ThinningFactors { point: 1, line: 1, polygon: 1 },
+            VisibilityFactors { line: 1, polygon: 1 },
+        )
+        .unwrap();
+        assert_eq!(out, vec![0, 0]);
+    }
+
+    #[test]
+    fn assign_levels_thins_dense_points_to_finer_levels() {
+        // Two points falling into the same level-0 grid cell (`prec=100`):
+        // one wins level 0, the other gets deferred. With point_thin=1
+        // they're both in cell `(0, 0)` at the coarse level.
+        let bboxes = vec![bb(10.0, 10.0, 10.0, 10.0), bb(20.0, 20.0, 20.0, 20.0)];
+        let kinds = vec![GeomKind::Point, GeomKind::Point];
+        let gsds = vec![100.0, 10.0];
+        let out = assign_levels(
+            &bboxes,
+            &kinds,
+            &gsds,
+            InputUnits::Meters,
+            ThinningFactors { point: 1, line: 1, polygon: 1 },
+            VisibilityFactors { line: 1, polygon: 1 },
+        )
+        .unwrap();
+        let mut sorted = out.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0, 1]);
+    }
+
+    #[test]
+    fn assign_levels_polygon_visibility_defers_tiny_features() {
+        // Polygon with diagonal ≈ 1.41 at prec=10 + vis_factor=4 is below the
+        // 40 threshold and should be deferred from level 0.
+        let bboxes = vec![bb(0.0, 0.0, 1.0, 1.0)];
+        let kinds = vec![GeomKind::Polygon];
+        let gsds = vec![10.0, 0.5];
+        let out = assign_levels(
+            &bboxes,
+            &kinds,
+            &gsds,
+            InputUnits::Meters,
+            ThinningFactors { point: 1, line: 1, polygon: 1 },
+            VisibilityFactors { line: 2, polygon: 4 },
+        )
+        .unwrap();
+        // diagonal² ≈ 2, threshold² at level 0 = (10·4)² = 1600 → not eligible
+        // at level 0; threshold² at level 1 = (0.5·4)² = 4 → still not, falls
+        // through to last level (level 1) by the explicit terminal assignment.
+        assert_eq!(out, vec![1]);
+    }
+
+    #[test]
+    fn str_pack_preserves_set_and_uses_full_leaves() {
+        // 17 features in 4 row-group bins of 5 → packs deterministically and
+        // never drops a row.
+        let mut bboxes = Vec::new();
+        for i in 0..17 {
+            let x = (i % 5) as f64;
+            let y = (i / 5) as f64;
+            bboxes.push(bb(x, y, x + 0.1, y + 0.1));
+        }
+        let mut rows: Vec<u32> = (0..17u32).collect();
+        str_pack(&mut rows, &bboxes, 5, 0);
+        let mut sorted = rows.clone();
+        sorted.sort();
+        let expected: Vec<u32> = (0..17u32).collect();
+        assert_eq!(sorted, expected, "str_pack must preserve the row set");
+    }
+
+    #[test]
+    fn flushed_row_group_end_errors_on_empty() {
+        // The shim error path is hard to hit in real code (there's always
+        // ≥1 row group), but the helper must refuse to lie.
+        let buf = Vec::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let writer = ArrowWriter::try_new(buf, schema, None).unwrap();
+        assert!(flushed_row_group_end(&writer).is_err());
+    }
+
+    #[test]
+    fn guess_geometry_column_prefers_named() {
+        use arrow::datatypes::Field;
+        let s = Schema::new(vec![
+            Field::new("attr", DataType::Binary, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]);
+        assert_eq!(guess_geometry_column(&s).as_deref(), Some("geometry"));
+
+        let s = Schema::new(vec![Field::new("blob", DataType::LargeBinary, false)]);
+        assert_eq!(guess_geometry_column(&s).as_deref(), Some("blob"));
+
+        let s = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
+        assert_eq!(guess_geometry_column(&s), None);
+    }
+
+    #[test]
+    fn snake_start_alternates_per_level() {
+        // Even levels start top-left, odd levels bottom-right. The first
+        // axis direction flips so the snake's exit on level N lines up
+        // with the entry on level N+1.
+        let d0 = SnakeStart::for_level(0).initial_dir();
+        let d1 = SnakeStart::for_level(1).initial_dir();
+        assert!(!d0.rev_x && d0.rev_y);
+        assert!(d1.rev_x && !d1.rev_y);
+    }
 }

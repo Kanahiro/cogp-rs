@@ -469,6 +469,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-schema",
  "byteorder",
+ "bytes",
  "clap",
  "parquet",
  "rayon",

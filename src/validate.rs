@@ -119,11 +119,12 @@ pub fn run(path: &Path) -> Result<()> {
             }
         }
         prev_rge = Some(level.row_group_end);
-        if !(level.gsd > 0.0) {
+        // partial_cmp so NaN gsd values also fall into the error branch.
+        if level.gsd.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             errors.push(format!("levels[{i}].gsd={} must be positive", level.gsd));
         }
         if let Some(p) = prev_gsd {
-            if !(level.gsd < p) {
+            if level.gsd.partial_cmp(&p) != Some(std::cmp::Ordering::Less) {
                 errors.push(format!(
                     "levels[{i}].gsd={} must be strictly less than previous ({})",
                     level.gsd, p

@@ -122,7 +122,7 @@ fn read_geom<R: Read>(cur: &mut R, bbox: &mut Bbox, kind: &mut GeomKind) -> Resu
         1 => read_point(cur, order, extra_per_pt, bbox)?,
         2 => read_linestring(cur, order, extra_per_pt, bbox)?,
         3 => read_polygon(cur, order, extra_per_pt, bbox)?,
-        4 | 5 | 6 | 7 => {
+        4..=7 => {
             let n = read_u32(cur, order)?;
             for _ in 0..n {
                 read_geom(cur, bbox, kind)?;
@@ -172,4 +172,222 @@ fn read_polygon<R: Read>(cur: &mut R, order: u8, extra: usize, bbox: &mut Bbox) 
         read_linestring(cur, order, extra, bbox)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Minimal little-endian WKB writer used by the test cases below.
+    struct Wkb(Vec<u8>);
+    impl Wkb {
+        fn new(type_code: u32) -> Self {
+            let mut v = Vec::with_capacity(5);
+            v.push(1); // little-endian
+            v.extend_from_slice(&type_code.to_le_bytes());
+            Self(v)
+        }
+        fn u32(mut self, x: u32) -> Self {
+            self.0.extend_from_slice(&x.to_le_bytes());
+            self
+        }
+        fn xy(mut self, x: f64, y: f64) -> Self {
+            self.0.extend_from_slice(&x.to_le_bytes());
+            self.0.extend_from_slice(&y.to_le_bytes());
+            self
+        }
+        fn f64v(mut self, x: f64) -> Self {
+            self.0.extend_from_slice(&x.to_le_bytes());
+            self
+        }
+        fn done(self) -> Vec<u8> {
+            self.0
+        }
+    }
+
+    fn point_le(x: f64, y: f64) -> Vec<u8> {
+        Wkb::new(1).xy(x, y).done()
+    }
+
+    fn bbox_close(a: Bbox, x0: f64, y0: f64, x1: f64, y1: f64) {
+        assert!((a.xmin - x0).abs() < 1e-9, "xmin {} != {}", a.xmin, x0);
+        assert!((a.ymin - y0).abs() < 1e-9, "ymin {} != {}", a.ymin, y0);
+        assert!((a.xmax - x1).abs() < 1e-9, "xmax {} != {}", a.xmax, x1);
+        assert!((a.ymax - y1).abs() < 1e-9, "ymax {} != {}", a.ymax, y1);
+    }
+
+    #[test]
+    fn bbox_ops() {
+        let mut b = Bbox::empty();
+        assert!(b.is_empty());
+        b.add(1.0, 2.0);
+        b.add(3.0, 4.0);
+        assert_eq!(b.width(), 2.0);
+        assert_eq!(b.height(), 2.0);
+        assert_eq!(b.cx(), 2.0);
+        assert_eq!(b.cy(), 3.0);
+        let mut c = Bbox::empty();
+        c.add(0.0, 0.0);
+        b.merge(&c);
+        bbox_close(b, 0.0, 0.0, 3.0, 4.0);
+    }
+
+    #[test]
+    fn point_little_endian() {
+        let (b, k) = bbox_from_wkb(&point_le(10.0, 20.0)).unwrap();
+        bbox_close(b, 10.0, 20.0, 10.0, 20.0);
+        assert_eq!(k, GeomKind::Point);
+    }
+
+    #[test]
+    fn point_big_endian() {
+        let mut bytes = vec![0u8]; // big-endian
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&1.5f64.to_be_bytes());
+        bytes.extend_from_slice(&2.5f64.to_be_bytes());
+        let (b, k) = bbox_from_wkb(&bytes).unwrap();
+        bbox_close(b, 1.5, 2.5, 1.5, 2.5);
+        assert_eq!(k, GeomKind::Point);
+    }
+
+    #[test]
+    fn linestring_kind_and_bbox() {
+        let bytes = Wkb::new(2).u32(3).xy(0.0, 0.0).xy(5.0, 1.0).xy(2.0, 4.0).done();
+        let (b, k) = bbox_from_wkb(&bytes).unwrap();
+        bbox_close(b, 0.0, 0.0, 5.0, 4.0);
+        assert_eq!(k, GeomKind::Line);
+    }
+
+    #[test]
+    fn polygon_kind_and_bbox() {
+        // single ring, 4 points (closed quad)
+        let bytes = Wkb::new(3)
+            .u32(1) // rings
+            .u32(4) // points
+            .xy(0.0, 0.0)
+            .xy(10.0, 0.0)
+            .xy(10.0, 10.0)
+            .xy(0.0, 0.0)
+            .done();
+        let (b, k) = bbox_from_wkb(&bytes).unwrap();
+        bbox_close(b, 0.0, 0.0, 10.0, 10.0);
+        assert_eq!(k, GeomKind::Polygon);
+    }
+
+    #[test]
+    fn multipoint_kind_is_point() {
+        // MultiPoint with two child points
+        let child1 = point_le(1.0, 2.0);
+        let child2 = point_le(3.0, 4.0);
+        let mut bytes = Wkb::new(4).u32(2).done();
+        bytes.extend(child1);
+        bytes.extend(child2);
+        let (b, k) = bbox_from_wkb(&bytes).unwrap();
+        bbox_close(b, 1.0, 2.0, 3.0, 4.0);
+        assert_eq!(k, GeomKind::Point);
+    }
+
+    #[test]
+    fn geometry_collection_picks_highest_dim() {
+        // Collection of a Point and a Polygon; kind should be Polygon.
+        let pt = point_le(0.0, 0.0);
+        let poly = Wkb::new(3)
+            .u32(1)
+            .u32(4)
+            .xy(0.0, 0.0)
+            .xy(5.0, 0.0)
+            .xy(5.0, 5.0)
+            .xy(0.0, 0.0)
+            .done();
+        let mut bytes = Wkb::new(7).u32(2).done();
+        bytes.extend(pt);
+        bytes.extend(poly);
+        let (b, k) = bbox_from_wkb(&bytes).unwrap();
+        bbox_close(b, 0.0, 0.0, 5.0, 5.0);
+        assert_eq!(k, GeomKind::Polygon);
+    }
+
+    #[test]
+    fn point_z_iso_skips_z_coord() {
+        // ISO PointZ has type 1001 and three coords per vertex.
+        let bytes = Wkb::new(1001).xy(7.0, 8.0).f64v(99.0).done();
+        let (b, k) = bbox_from_wkb(&bytes).unwrap();
+        bbox_close(b, 7.0, 8.0, 7.0, 8.0);
+        assert_eq!(k, GeomKind::Point);
+    }
+
+    #[test]
+    fn point_m_iso_skips_m_coord() {
+        let bytes = Wkb::new(2001).xy(7.0, 8.0).f64v(99.0).done();
+        let (b, k) = bbox_from_wkb(&bytes).unwrap();
+        bbox_close(b, 7.0, 8.0, 7.0, 8.0);
+        assert_eq!(k, GeomKind::Point);
+    }
+
+    #[test]
+    fn point_zm_iso_skips_two_extras() {
+        let bytes = Wkb::new(3001).xy(7.0, 8.0).f64v(99.0).f64v(42.0).done();
+        let (b, _) = bbox_from_wkb(&bytes).unwrap();
+        bbox_close(b, 7.0, 8.0, 7.0, 8.0);
+    }
+
+    #[test]
+    fn ewkb_point_with_srid() {
+        // EWKB Point with SRID flag (0x20000000) + Z flag (0x80000000).
+        let type_code: u32 = 1 | 0x20000000 | 0x80000000;
+        let mut bytes = vec![1u8];
+        bytes.extend_from_slice(&type_code.to_le_bytes());
+        bytes.extend_from_slice(&4326u32.to_le_bytes()); // SRID
+        bytes.extend_from_slice(&1.0f64.to_le_bytes());
+        bytes.extend_from_slice(&2.0f64.to_le_bytes());
+        bytes.extend_from_slice(&3.0f64.to_le_bytes()); // Z
+        let (b, k) = bbox_from_wkb(&bytes).unwrap();
+        bbox_close(b, 1.0, 2.0, 1.0, 2.0);
+        assert_eq!(k, GeomKind::Point);
+    }
+
+    #[test]
+    fn empty_polygon_errors() {
+        // Polygon with zero rings has no points, so the bbox stays empty.
+        let bytes = Wkb::new(3).u32(0).done();
+        assert!(bbox_from_wkb(&bytes).is_err());
+    }
+
+    #[test]
+    fn bad_byte_order_errors() {
+        let bytes = vec![2u8, 0, 0, 0, 1];
+        assert!(bbox_from_wkb(&bytes).is_err());
+    }
+
+    #[test]
+    fn unsupported_geom_type_errors() {
+        let bytes = Wkb::new(99).done();
+        assert!(bbox_from_wkb(&bytes).is_err());
+    }
+
+    #[test]
+    fn truncated_wkb_errors() {
+        // header only — no payload for a Point
+        let bytes = vec![1u8, 1, 0, 0, 0];
+        assert!(bbox_from_wkb(&bytes).is_err());
+    }
+
+    #[test]
+    fn kind_from_wkb_fast_path() {
+        assert_eq!(kind_from_wkb(&point_le(0.0, 0.0)).unwrap(), GeomKind::Point);
+        let ls = Wkb::new(2).u32(0).done();
+        assert_eq!(kind_from_wkb(&ls).unwrap(), GeomKind::Line);
+        let poly = Wkb::new(3).u32(0).done();
+        assert_eq!(kind_from_wkb(&poly).unwrap(), GeomKind::Polygon);
+        let mp = Wkb::new(4).u32(0).done();
+        assert_eq!(kind_from_wkb(&mp).unwrap(), GeomKind::Point);
+        // ISO MultiPolygon (1006) → Polygon
+        let iso_mp = Wkb::new(1006).u32(0).done();
+        assert_eq!(kind_from_wkb(&iso_mp).unwrap(), GeomKind::Polygon);
+    }
+
+    #[test]
+    fn kind_from_wkb_short_input_errors() {
+        assert!(kind_from_wkb(&[1, 0, 0]).is_err());
+    }
 }
