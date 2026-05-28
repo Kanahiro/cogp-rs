@@ -1,6 +1,6 @@
 # cogp
 
-Rust reference CLI for the [Cloud Optimized GeoParquet Profile (COGP)](../SPEC.md).
+Rust reference CLI for the [Cloud Optimized GeoParquet Profile (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet).
 
 `convert` reorders the features of a GeoParquet file across row groups using
 grid-based density thinning per level and Sort-Tile-Recursive (STR) bbox packing
