@@ -12,7 +12,7 @@ use arrow::array::{
     ArrayRef, BinaryArray, Float64Array, Int32Array, RecordBatch, StringArray, StructArray,
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
-use cogp::convert::{ConvertArgs, InputUnits};
+use cogp::convert::{ConvertArgs, InputUnits, SortKeyOrder};
 use cogp::meta::{BboxCovering, Covering, GeoColumn, GeoMeta, GEO_METADATA_KEY};
 use cogp::reader::Reader;
 use parquet::arrow::ArrowWriter;
@@ -147,6 +147,8 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         polygon_thinning_factor: 1,
         line_visibility_factor: 2,
         polygon_visibility_factor: 4,
+        sort_key: None,
+        sort_order: SortKeyOrder::Desc,
     }
 }
 

@@ -3,7 +3,7 @@ use arrow::array::{
     Array, ArrayRef, BinaryArray, Float64Array, LargeBinaryArray, RecordBatch, StringArray,
     StructArray, UInt32Array,
 };
-use arrow::compute::{cast, concat_batches, take};
+use arrow::compute::{cast, concat_batches, rank, take, SortOptions};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use clap::Args;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -116,6 +116,29 @@ pub struct ConvertArgs {
     /// Set to `1` to disable.
     #[arg(long, default_value_t = 4)]
     pub polygon_visibility_factor: u32,
+    /// Attribute column deciding which feature wins when several contend for the
+    /// same thinning cell. When set it is the primary criterion: the
+    /// higher-ranked feature survives to coarser levels, so the more important
+    /// one is kept instead of an arbitrary one. Bbox size only breaks ties
+    /// between equal-valued features (e.g. same road class → keep the longer
+    /// one), then a deterministic row-index hash. Works for all geometry kinds,
+    /// including points (whose bbox size is always zero). The column must be
+    /// rank-able: numeric, boolean, or string. Rows whose value is null always
+    /// lose the tie.
+    #[arg(long)]
+    pub sort_key: Option<String>,
+    /// Direction for --sort-key: `desc` (default) keeps the feature with the
+    /// largest value, `asc` keeps the smallest. Ignored when --sort-key is unset.
+    #[arg(long, default_value = "desc")]
+    pub sort_order: SortKeyOrder,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum SortKeyOrder {
+    /// Largest --sort-key value wins the cell.
+    Desc,
+    /// Smallest --sort-key value wins the cell.
+    Asc,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -401,6 +424,17 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             }
         };
 
+    let sort_ranks = compute_sort_ranks(&table, args.sort_key.as_deref(), args.sort_order)?;
+    if let Some(col) = &args.sort_key {
+        eprintln!(
+            "      tie-break sort key: {col} ({})",
+            match args.sort_order {
+                SortKeyOrder::Desc => "desc, largest wins",
+                SortKeyOrder::Asc => "asc, smallest wins",
+            }
+        );
+    }
+
     eprintln!("[3/4] Assigning features to {} level(s)", gsds.len());
     let assignment = assign_levels(
         &bboxes,
@@ -416,6 +450,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             line: args.line_visibility_factor,
             polygon: args.polygon_visibility_factor,
         },
+        &sort_ranks,
     )?;
     let mut per_level_full: Vec<Vec<u32>> = vec![Vec::new(); gsds.len()];
     for (idx, level_i) in assignment.iter().enumerate() {
@@ -891,15 +926,47 @@ struct VisibilityFactors {
     polygon: u32,
 }
 
+/// Per-row tie-break ranks derived from the `--sort-key` attribute column: a
+/// larger rank means higher priority within a thinning cell (see `priority`).
+/// Equal column values share a rank, so ties still fall through to the hashed
+/// row index; null values rank below every non-null and so always lose.
+/// Returns all-zero ranks when no key is given, leaving `priority` unchanged.
+fn compute_sort_ranks(
+    table: &RecordBatch,
+    sort_key: Option<&str>,
+    order: SortKeyOrder,
+) -> Result<Vec<u64>> {
+    let Some(col_name) = sort_key else {
+        return Ok(vec![0u64; table.num_rows()]);
+    };
+    let idx = table
+        .schema()
+        .index_of(col_name)
+        .with_context(|| format!("--sort-key column `{col_name}` not found"))?;
+    // nulls_first keeps nulls at the lowest rank in both directions; `descending`
+    // only flips which end of the value range earns the highest (winning) rank.
+    let opts = SortOptions {
+        descending: matches!(order, SortKeyOrder::Asc),
+        nulls_first: true,
+    };
+    let ranks = rank(table.column(idx).as_ref(), Some(opts))
+        .with_context(|| format!("ranking --sort-key column `{col_name}`"))?;
+    Ok(ranks.into_iter().map(u64::from).collect())
+}
+
 /// Grid-based density thinning. Returns an assignment of each row to a level index.
 ///
 /// For each level (coarse → fine), bucket remaining features into grid cells of side
 /// `prec` (the level's GSD in input CRS units). Within each cell, pick the highest-
 /// priority feature to assign to this level; the rest fall through to the next level.
 ///
-/// Features whose bbox is smaller than `prec` are deferred to a finer level where they
-/// become independently meaningful — except Point-kind features which are always
-/// eligible from the coarsest level (they have no extent of their own).
+/// A feature whose bbox is smaller than `prec` is *demoted*, not excluded: within a
+/// cell it loses to any feature already meaningful at this level, but if its cell holds
+/// no such feature it still wins and is placed here rather than deferred. This keeps a
+/// sparse coarse level populated instead of leaving cells empty just because the only
+/// candidate is small (a hard cutoff would collapse a dataset of uniformly tiny features
+/// entirely onto the finest level). Crowding stays bounded by the one-pick-per-cell rule.
+/// Point-kind features have no extent and are meaningful from level 0.
 ///
 /// Cells already occupied by a feature assigned at a coarser level are blocked: any
 /// remaining candidate whose center re-projects into such a cell at the current
@@ -914,6 +981,7 @@ fn assign_levels(
     units: InputUnits,
     thinning: ThinningFactors,
     visibility: VisibilityFactors,
+    sort_ranks: &[u64],
 ) -> Result<Vec<u16>> {
     // WGS84 equatorial circumference / 360°: meters per degree of longitude at the equator.
     // Used only as a rendering-grade scale factor — see the README note on geodesy.
@@ -946,7 +1014,8 @@ fn assign_levels(
     // diagonal ≥ `vis_factor · prec` for the feature's kind. Diagonal — rather
     // than max(w, h) — so a 45° line is rated by its actual length, not its
     // axis-aligned shadow. Compared in squared form to avoid a per-row sqrt.
-    // Points have no extent so are always eligible from level 0.
+    // Points have no extent so are meaningful from level 0. Consumed as a soft
+    // priority tier, not a hard gate — see `score`.
     let sq_line_vis: Vec<f64> = precs
         .iter()
         .map(|p| (p * line_vis_mul) * (p * line_vis_mul))
@@ -1009,17 +1078,25 @@ fn assign_levels(
             .map(|&row| cell_key(row, *prec))
             .collect();
 
+        // Prepend "visible at this level" so a meaningful feature outranks a
+        // sub-threshold one contesting the same cell, while an uncontested
+        // sub-threshold feature still wins (the demotion documented on the fn).
+        // Below the visibility bit, the usual `priority` orders.
+        let score = |row: u32| -> (bool, (u64, u64, u64)) {
+            (
+                min_visible[row as usize] as usize <= level_i,
+                priority(&bboxes[row as usize], sort_ranks[row as usize], row),
+            )
+        };
+
         // Per-cell winner map built in parallel: each thread folds into a local
-        // HashMap, then reduce merges them keeping the higher-priority row on
+        // HashMap, then reduce merges them keeping the higher-score row on
         // collision. The key is `(kind, ix, iy)` — kind-tagged because each
         // kind uses a different grid pitch, and an untagged `(ix, iy)` would
         // conflate the grids.
         let best: HashMap<(u8, i64, i64), u32> = remaining
             .par_iter()
             .fold(HashMap::new, |mut local, &row| {
-                if min_visible[row as usize] as usize > level_i {
-                    return local;
-                }
                 let key = cell_key(row, *prec);
                 if blocked.contains(&key) {
                     return local;
@@ -1029,9 +1106,7 @@ fn assign_levels(
                         local.insert(key, row);
                     }
                     Some(&cur) => {
-                        if priority(&bboxes[row as usize], row)
-                            > priority(&bboxes[cur as usize], cur)
-                        {
+                        if score(row) > score(cur) {
                             local.insert(key, row);
                         }
                     }
@@ -1048,9 +1123,7 @@ fn assign_levels(
                             a.insert(k, row);
                         }
                         Some(&cur) => {
-                            if priority(&bboxes[row as usize], row)
-                                > priority(&bboxes[cur as usize], cur)
-                            {
+                            if score(row) > score(cur) {
                                 a.insert(k, row);
                             }
                         }
@@ -1082,14 +1155,21 @@ fn assign_levels(
     Ok(out)
 }
 
-/// Primary order: bbox diagonal `w² + h²` (squared, monotonic in the real
-/// diagonal, bits give a total order over f64 including NaN guard). Used as
-/// a kind-agnostic, orientation-independent "size" proxy: a 45° line scores
-/// the same as an axis-aligned line of equal true length, and a square
-/// polygon scores the same as a 90°-rotated one. For points it is 0 so ties
-/// fall through to the hashed secondary. Secondary: hashed row index for a
+/// Primary order: `sort_rank`, the optional `--sort-key` attribute rank — 0 for
+/// every row when no key is given, so it drops out and bbox size leads as
+/// before. Secondary: bbox diagonal `w² + h²` (squared, monotonic in the real
+/// diagonal, bits give a total order over f64 including NaN guard) — a
+/// kind-agnostic, orientation-independent "size" proxy: a 45° line scores the
+/// same as an axis-aligned line of equal true length, and a square polygon
+/// scores the same as a 90°-rotated one. Tertiary: hashed row index for a
 /// deterministic tie-break.
-fn priority(b: &Bbox, row: u32) -> (u64, u64) {
+///
+/// `sort_rank` leads rather than trails the size: polygon/line bbox diagonals
+/// are continuous and practically never tie, so a sort key ranked *below* size
+/// could never decide anything for them. Above size it governs every kind, with
+/// size breaking ties between equal-ranked features (e.g. same road class → keep
+/// the longer one) and, for points, being a constant 0 so the rank fully orders.
+fn priority(b: &Bbox, sort_rank: u64, row: u32) -> (u64, u64, u64) {
     let w = b.width().max(0.0);
     let h = b.height().max(0.0);
     let sq_diag = w * w + h * h;
@@ -1101,7 +1181,7 @@ fn priority(b: &Bbox, row: u32) -> (u64, u64) {
     let mut hash = row as u64;
     hash = hash.wrapping_mul(0x9E3779B97F4A7C15);
     hash ^= hash >> 30;
-    (sq_bits, hash)
+    (sort_rank, sq_bits, hash)
 }
 
 /// Per-axis sort direction inherited down the recursion tree.
@@ -1317,17 +1397,24 @@ mod tests {
     }
 
     #[test]
-    fn priority_orders_by_diagonal_then_hash() {
-        // Larger diagonal beats smaller diagonal.
-        let small = priority(&bb(0.0, 0.0, 1.0, 1.0), 0);
-        let large = priority(&bb(0.0, 0.0, 10.0, 10.0), 0);
+    fn priority_orders_by_sort_rank_then_diagonal_then_hash() {
+        // Higher sort rank wins even against a much larger bbox — the sort key
+        // leads so it actually decides for polygons/lines, not just points.
+        let big_low_rank = priority(&bb(0.0, 0.0, 10.0, 10.0), 1, 0);
+        let small_high_rank = priority(&bb(0.0, 0.0, 1.0, 1.0), 2, 0);
+        assert!(small_high_rank > big_low_rank);
+
+        // Equal sort rank → larger diagonal wins.
+        let small = priority(&bb(0.0, 0.0, 1.0, 1.0), 5, 0);
+        let large = priority(&bb(0.0, 0.0, 10.0, 10.0), 5, 0);
         assert!(large > small);
 
-        // Same diagonal, different row → deterministic but distinguishable.
-        let a = priority(&bb(0.0, 0.0, 1.0, 1.0), 0);
-        let b = priority(&bb(0.0, 0.0, 1.0, 1.0), 1);
-        assert_eq!(a.0, b.0);
-        assert_ne!(a.1, b.1);
+        // Equal sort rank and diagonal, different row → deterministic but
+        // distinguishable via the hashed tertiary key.
+        let a = priority(&bb(0.0, 0.0, 1.0, 1.0), 0, 0);
+        let b = priority(&bb(0.0, 0.0, 1.0, 1.0), 0, 1);
+        assert_eq!((a.0, a.1), (b.0, b.1));
+        assert_ne!(a.2, b.2);
     }
 
     #[test]
@@ -1343,6 +1430,7 @@ mod tests {
             InputUnits::Meters,
             ThinningFactors { point: 1, line: 1, polygon: 1 },
             VisibilityFactors { line: 1, polygon: 1 },
+            &[0, 0],
         )
         .unwrap();
         assert_eq!(out, vec![0, 0]);
@@ -1363,6 +1451,7 @@ mod tests {
             InputUnits::Meters,
             ThinningFactors { point: 1, line: 1, polygon: 1 },
             VisibilityFactors { line: 1, polygon: 1 },
+            &[0, 0],
         )
         .unwrap();
         let mut sorted = out.clone();
@@ -1371,9 +1460,57 @@ mod tests {
     }
 
     #[test]
-    fn assign_levels_polygon_visibility_defers_tiny_features() {
-        // Polygon with diagonal ≈ 1.41 at prec=10 + vis_factor=4 is below the
-        // 40 threshold and should be deferred from level 0.
+    fn assign_levels_sort_rank_picks_cell_winner() {
+        // Same dense-cluster setup as above (both points share level-0 cell
+        // (0,0)), but a higher sort rank on row 1 forces it to win level 0,
+        // overriding the otherwise-arbitrary hashed tie-break.
+        let bboxes = vec![bb(10.0, 10.0, 10.0, 10.0), bb(20.0, 20.0, 20.0, 20.0)];
+        let kinds = vec![GeomKind::Point, GeomKind::Point];
+        let gsds = vec![100.0, 10.0];
+        let out = assign_levels(
+            &bboxes,
+            &kinds,
+            &gsds,
+            InputUnits::Meters,
+            ThinningFactors { point: 1, line: 1, polygon: 1 },
+            VisibilityFactors { line: 1, polygon: 1 },
+            &[1, 5],
+        )
+        .unwrap();
+        assert_eq!(out, vec![1, 0]);
+    }
+
+    #[test]
+    fn compute_sort_ranks_orders_by_value_and_sinks_nulls() {
+        use arrow::array::Int32Array;
+        let col = Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(20)])) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new("score", DataType::Int32, true)]));
+        let table = RecordBatch::try_new(schema, vec![col]).unwrap();
+
+        // desc → largest value gets the highest rank, null the lowest.
+        let desc = compute_sort_ranks(&table, Some("score"), SortKeyOrder::Desc).unwrap();
+        assert!(desc[2] > desc[3] && desc[3] > desc[0] && desc[0] > desc[1]);
+
+        // asc → smallest value gets the highest rank, null still lowest.
+        let asc = compute_sort_ranks(&table, Some("score"), SortKeyOrder::Asc).unwrap();
+        assert!(asc[0] > asc[3] && asc[3] > asc[2] && asc[2] > asc[1]);
+
+        // No key → all zeros (priority unaffected).
+        assert_eq!(
+            compute_sort_ranks(&table, None, SortKeyOrder::Desc).unwrap(),
+            vec![0, 0, 0, 0]
+        );
+
+        // Unknown column → error.
+        assert!(compute_sort_ranks(&table, Some("missing"), SortKeyOrder::Desc).is_err());
+    }
+
+    #[test]
+    fn assign_levels_tiny_feature_fills_empty_coarse_cell() {
+        // A lone polygon below the visibility threshold (diagonal² ≈ 2 vs the
+        // level-0 threshold² of (10·4)² = 1600) is no longer deferred: with no
+        // visible competitor in its cell it fills the otherwise-empty coarse
+        // level 0 rather than collapsing onto the finest level.
         let bboxes = vec![bb(0.0, 0.0, 1.0, 1.0)];
         let kinds = vec![GeomKind::Polygon];
         let gsds = vec![10.0, 0.5];
@@ -1384,12 +1521,33 @@ mod tests {
             InputUnits::Meters,
             ThinningFactors { point: 1, line: 1, polygon: 1 },
             VisibilityFactors { line: 2, polygon: 4 },
+            &[0],
         )
         .unwrap();
-        // diagonal² ≈ 2, threshold² at level 0 = (10·4)² = 1600 → not eligible
-        // at level 0; threshold² at level 1 = (0.5·4)² = 4 → still not, falls
-        // through to last level (level 1) by the explicit terminal assignment.
-        assert_eq!(out, vec![1]);
+        assert_eq!(out, vec![0]);
+    }
+
+    #[test]
+    fn assign_levels_visible_feature_beats_subthreshold_in_same_cell() {
+        // Two polygons in the same level-0 cell (pitch 10): the visible one
+        // (diagonal² = 3200 ≥ 1600) wins level 0; the sub-threshold one
+        // (diagonal² = 2) is demoted to a finer level, not dropped.
+        let big = bb(-15.0, -15.0, 25.0, 25.0); // center (5,5)
+        let small = bb(1.0, 1.0, 2.0, 2.0); // center (1.5,1.5)
+        let bboxes = vec![big, small];
+        let kinds = vec![GeomKind::Polygon, GeomKind::Polygon];
+        let gsds = vec![10.0, 0.5];
+        let out = assign_levels(
+            &bboxes,
+            &kinds,
+            &gsds,
+            InputUnits::Meters,
+            ThinningFactors { point: 1, line: 1, polygon: 1 },
+            VisibilityFactors { line: 2, polygon: 4 },
+            &[0, 0],
+        )
+        .unwrap();
+        assert_eq!(out, vec![0, 1]);
     }
 
     #[test]
