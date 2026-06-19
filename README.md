@@ -106,18 +106,17 @@ Other options:
 - `--line-visibility-factor` (default `2`) — coarsest level at which a
   LineString is considered independently meaningful: its bbox diagonal must
   reach `factor · GSD` of that level. Lines are 1D so a diagonal equal to
-  one GSD is only a hairline. This is a *soft* preference, not a cutoff: a
-  short line yields its cell to any meaningful line competing for it, but if
-  the cell is otherwise empty it is still kept at that level rather than
-  deferred (so sparse coarse levels stay populated). Distinct from
+  one GSD is only a hairline. This is a hard cutoff: a line shorter than the
+  threshold is excluded from that level and deferred to a finer one, so a
+  coarse-zoom read never fetches sub-resolution lines. Distinct from
   `--line-thinning-factor` (which controls grid cell pitch). Set to `1` to disable.
 - `--polygon-visibility-factor` (default `4`) — coarsest level at which a
   Polygon is considered independently meaningful: its bbox diagonal must
-  reach `factor · GSD` of that level. Soft, like `--line-visibility-factor`:
-  a tiny polygon loses a contested cell to a larger one but still fills an
-  otherwise-empty cell instead of being pushed to a finer level. The default
-  keeps coarse levels from being crowded by tiny polygons where larger ones
-  exist. Distinct from `--polygon-thinning-factor`. Set to `1` to disable.
+  reach `factor · GSD` of that level. A hard cutoff, like
+  `--line-visibility-factor`: a polygon below the threshold is excluded from
+  that level and deferred to a finer one. The default keeps coarse levels from
+  being crowded by tiny polygons. Distinct from `--polygon-thinning-factor`.
+  Set to `1` to disable.
 - `--sort-key` — attribute column that decides which feature wins when several
   contend for the same thinning cell. When set it is the primary criterion: the
   higher-ranked feature survives to coarser levels, so the more important one is

@@ -960,13 +960,15 @@ fn compute_sort_ranks(
 /// `prec` (the level's GSD in input CRS units). Within each cell, pick the highest-
 /// priority feature to assign to this level; the rest fall through to the next level.
 ///
-/// A feature whose bbox is smaller than `prec` is *demoted*, not excluded: within a
-/// cell it loses to any feature already meaningful at this level, but if its cell holds
-/// no such feature it still wins and is placed here rather than deferred. This keeps a
-/// sparse coarse level populated instead of leaving cells empty just because the only
-/// candidate is small (a hard cutoff would collapse a dataset of uniformly tiny features
-/// entirely onto the finest level). Crowding stays bounded by the one-pick-per-cell rule.
-/// Point-kind features have no extent and are meaningful from level 0.
+/// A feature is *eligible* at a level only once its bbox diagonal reaches
+/// `vis_factor · prec` for its kind (see `min_visible`); below that it is excluded and
+/// deferred to a finer level where it becomes independently meaningful. This is a hard
+/// gate, not a tie-break: it keeps a level's feature count bounded by screen density, so
+/// the reader never fetches sub-resolution features at a coarse zoom (the read cost of a
+/// progressive `up_to_gsd` read stays independent of total dataset size). The trade-off
+/// is that a lone sub-threshold feature does not appear at coarser zooms even where its
+/// cell is otherwise empty. Point-kind features have no extent and are eligible from
+/// level 0.
 ///
 /// Cells already occupied by a feature assigned at a coarser level are blocked: any
 /// remaining candidate whose center re-projects into such a cell at the current
@@ -1014,8 +1016,8 @@ fn assign_levels(
     // diagonal ≥ `vis_factor · prec` for the feature's kind. Diagonal — rather
     // than max(w, h) — so a 45° line is rated by its actual length, not its
     // axis-aligned shadow. Compared in squared form to avoid a per-row sqrt.
-    // Points have no extent so are meaningful from level 0. Consumed as a soft
-    // priority tier, not a hard gate — see `score`.
+    // Points have no extent so are eligible from level 0. Used as a hard
+    // eligibility gate in the per-cell selection below.
     let sq_line_vis: Vec<f64> = precs
         .iter()
         .map(|p| (p * line_vis_mul) * (p * line_vis_mul))
@@ -1078,16 +1080,7 @@ fn assign_levels(
             .map(|&row| cell_key(row, *prec))
             .collect();
 
-        // Prepend "visible at this level" so a meaningful feature outranks a
-        // sub-threshold one contesting the same cell, while an uncontested
-        // sub-threshold feature still wins (the demotion documented on the fn).
-        // Below the visibility bit, the usual `priority` orders.
-        let score = |row: u32| -> (bool, (u64, u64, u64)) {
-            (
-                min_visible[row as usize] as usize <= level_i,
-                priority(&bboxes[row as usize], sort_ranks[row as usize], row),
-            )
-        };
+        let prio = |row: u32| priority(&bboxes[row as usize], sort_ranks[row as usize], row);
 
         // Per-cell winner map built in parallel: each thread folds into a local
         // HashMap, then reduce merges them keeping the higher-score row on
@@ -1097,6 +1090,14 @@ fn assign_levels(
         let best: HashMap<(u8, i64, i64), u32> = remaining
             .par_iter()
             .fold(HashMap::new, |mut local, &row| {
+                // Hard visibility gate: a feature not yet meaningful at this
+                // level (its bbox diagonal < `vis_factor · prec`) is excluded
+                // and deferred to a finer level. This bounds a level's feature
+                // count by screen density, so reads never fetch sub-resolution
+                // features at a coarse zoom. Points are meaningful from level 0.
+                if min_visible[row as usize] as usize > level_i {
+                    return local;
+                }
                 let key = cell_key(row, *prec);
                 if blocked.contains(&key) {
                     return local;
@@ -1106,7 +1107,7 @@ fn assign_levels(
                         local.insert(key, row);
                     }
                     Some(&cur) => {
-                        if score(row) > score(cur) {
+                        if prio(row) > prio(cur) {
                             local.insert(key, row);
                         }
                     }
@@ -1123,7 +1124,7 @@ fn assign_levels(
                             a.insert(k, row);
                         }
                         Some(&cur) => {
-                            if score(row) > score(cur) {
+                            if prio(row) > prio(cur) {
                                 a.insert(k, row);
                             }
                         }
@@ -1506,11 +1507,12 @@ mod tests {
     }
 
     #[test]
-    fn assign_levels_tiny_feature_fills_empty_coarse_cell() {
+    fn assign_levels_subthreshold_feature_deferred_to_finer_level() {
         // A lone polygon below the visibility threshold (diagonal² ≈ 2 vs the
-        // level-0 threshold² of (10·4)² = 1600) is no longer deferred: with no
-        // visible competitor in its cell it fills the otherwise-empty coarse
-        // level 0 rather than collapsing onto the finest level.
+        // level-0 threshold² of (10·4)² = 1600) is excluded from the coarse
+        // level by the hard gate even though its cell is otherwise empty, and
+        // deferred to the finest level. This is what bounds a coarse-zoom read
+        // by screen density instead of total dataset size.
         let bboxes = vec![bb(0.0, 0.0, 1.0, 1.0)];
         let kinds = vec![GeomKind::Polygon];
         let gsds = vec![10.0, 0.5];
@@ -1524,14 +1526,15 @@ mod tests {
             &[0],
         )
         .unwrap();
-        assert_eq!(out, vec![0]);
+        assert_eq!(out, vec![1]);
     }
 
     #[test]
     fn assign_levels_visible_feature_beats_subthreshold_in_same_cell() {
         // Two polygons in the same level-0 cell (pitch 10): the visible one
-        // (diagonal² = 3200 ≥ 1600) wins level 0; the sub-threshold one
-        // (diagonal² = 2) is demoted to a finer level, not dropped.
+        // (diagonal² = 3200 ≥ 1600) takes level 0; the sub-threshold one
+        // (diagonal² = 2) is gated out of level 0 and deferred to a finer
+        // level, not dropped.
         let big = bb(-15.0, -15.0, 25.0, 25.0); // center (5,5)
         let small = bb(1.0, 1.0, 2.0, 2.0); // center (1.5,1.5)
         let bboxes = vec![big, small];
