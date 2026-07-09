@@ -348,8 +348,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let file =
         File::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
     // Footer parsed once; both streaming passes below reuse it via
-    // `new_with_metadata`, and each pass opens its own file handle.
-    let arrow_meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
+    // `new_with_metadata`, and each pass opens its own file handle. The page
+    // index matters for pass 2: without it a row selection can only skip
+    // whole row groups, so every chunk would decompress all pages of every
+    // row group it touches instead of just the pages holding selected rows.
+    let arrow_meta =
+        ArrowReaderMetadata::load(&file, ArrowReaderOptions::new().with_page_index(true))?;
     drop(file);
 
     let input_schema = arrow_meta.schema().clone();
