@@ -549,11 +549,14 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .with_context(|| format!("creating {}", args.output.display()))?;
     let mut writer = ArrowWriter::try_new(out_file, output_schema.clone(), Some(props))?;
 
-    // Pass 2: a background thread gathers each output chunk straight from the
+    // Pass 2: a background thread gathers output chunks straight from the
     // input file (row-selection read + interleave into output order) while the
-    // main thread flushes the previous batch through the parquet writer.
-    // Capacity 2 overlaps I/O without unbounded buffering; resident memory is
-    // a few chunks of `row_group_size` rows, never the whole table.
+    // main thread flushes finished batches through the parquet writer. Chunks
+    // are independent, so the producer gathers them in rayon-parallel waves of
+    // one chunk per worker; each wave is sent in order once complete. Resident
+    // memory is bounded by one wave of `row_group_size`-row chunks plus the
+    // channel, never the whole table. The barrier per wave costs little
+    // because chunks are equal-sized and similarly priced.
     let (tx, rx) = sync_channel::<(usize, RecordBatch)>(2);
     let producer_schema = output_schema.clone();
     let producer_bboxes = Arc::new(bboxes);
@@ -563,16 +566,30 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let producer_per_level = per_level;
     let producer_row_group_size = args.row_group_size;
     let producer = thread::spawn(move || -> Result<()> {
-        for (level_i, rows) in producer_per_level.iter().enumerate() {
-            for chunk in rows.chunks(producer_row_group_size) {
-                let batches = gather_chunk(
-                    &producer_input,
-                    &producer_meta,
-                    &producer_keep,
-                    chunk,
-                    &producer_bboxes,
-                    &producer_schema,
-                )?;
+        let chunks: Vec<(usize, &[u32])> = producer_per_level
+            .iter()
+            .enumerate()
+            .flat_map(|(level_i, rows)| {
+                rows.chunks(producer_row_group_size)
+                    .map(move |chunk| (level_i, chunk))
+            })
+            .collect();
+        for wave in chunks.chunks(rayon::current_num_threads()) {
+            let gathered = wave
+                .par_iter()
+                .map(|(level_i, chunk)| {
+                    let batches = gather_chunk(
+                        &producer_input,
+                        &producer_meta,
+                        &producer_keep,
+                        chunk,
+                        &producer_bboxes,
+                        &producer_schema,
+                    )?;
+                    Ok((*level_i, batches))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (level_i, batches) in gathered {
                 for batch in batches {
                     if tx.send((level_i, batch)).is_err() {
                         return Ok(());
