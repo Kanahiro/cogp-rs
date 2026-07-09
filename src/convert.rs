@@ -858,8 +858,13 @@ fn scan_input(
         meta.metadata().file_metadata().schema_descr(),
         roots.iter().copied(),
     );
+    // Only 1-3 narrow columns are projected, so large batches are cheap and
+    // keep the per-batch rayon fan-out (WKB parsing) coarse enough that
+    // fork/join overhead stays negligible next to the parse work.
+    const SCAN_BATCH_ROWS: usize = 64 * 1024;
     let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta.clone())
         .with_projection(mask)
+        .with_batch_size(SCAN_BATCH_ROWS)
         .build()?;
 
     let n_rows = meta.metadata().file_metadata().num_rows() as usize;
