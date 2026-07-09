@@ -1,13 +1,16 @@
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, Float64Array, LargeBinaryArray, RecordBatch, StringArray,
-    StructArray, UInt32Array,
+    Array, ArrayRef, BinaryArray, Float64Array, GenericBinaryArray, LargeBinaryArray,
+    LargeStringArray, OffsetSizeTrait, RecordBatch, StringArray, StructArray,
 };
-use arrow::compute::{cast, concat_batches, rank, take, SortOptions};
+use arrow::compute::{cast, concat, interleave, rank, SortOptions};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use clap::Args;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
+};
+use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::Compression;
 use parquet::basic::ZstdLevel;
 use parquet::file::metadata::KeyValue;
@@ -17,7 +20,7 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::thread;
@@ -341,14 +344,21 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         bail!("--row-group-size must be >= 1");
     }
 
-    eprintln!("[1/4] Reading input: {}", args.input.display());
+    eprintln!("[1/4] Reading input metadata: {}", args.input.display());
     let file =
         File::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    // Footer parsed once; both streaming passes below reuse it via
+    // `new_with_metadata`, and each pass opens its own file handle. The page
+    // index matters for pass 2: without it a row selection can only skip
+    // whole row groups, so every chunk would decompress all pages of every
+    // row group it touches instead of just the pages holding selected rows.
+    let arrow_meta =
+        ArrowReaderMetadata::load(&file, ArrowReaderOptions::new().with_page_index(true))?;
+    drop(file);
 
-    let input_schema = builder.schema().clone();
-    let pq_meta = builder.metadata().clone();
-    let input_kv = pq_meta
+    let input_schema = arrow_meta.schema().clone();
+    let input_kv = arrow_meta
+        .metadata()
         .file_metadata()
         .key_value_metadata()
         .cloned()
@@ -389,42 +399,47 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         explicit => explicit,
     };
 
-    let reader = builder.build()?;
-    let mut input_batches = Vec::new();
-    for batch in reader {
-        input_batches.push(batch?);
-    }
-    if input_batches.is_empty() {
+    let n_rows = arrow_meta.metadata().file_metadata().num_rows() as usize;
+    if n_rows == 0 {
         bail!("input file has no rows");
     }
-
-    // arrow's GenericBytesBuilder<i32> panics with "byte array offset overflow"
-    // once cumulative bytes exceed i32::MAX (~2 GiB). `concat_batches` walks
-    // every column independently, so a panic can come from the geometry column
-    // *or* any sufficiently large attribute column (e.g. addresses on a
-    // country-scale building dataset). Upcast every Binary/Utf8 column that
-    // crosses the threshold to its i64-offset counterpart.
-    let (input_batches, input_schema) = upcast_large_offsets_if_needed(input_batches, input_schema)?;
-    let table: RecordBatch = concat_batches(&input_schema, &input_batches)?;
-    let n_rows = table.num_rows();
     eprintln!("      features: {n_rows}");
 
-    let (bboxes, kinds, existing_bbox_col) =
-        match read_existing_bboxes(&table, input_geo.as_ref(), &geom_col_name) {
-            Some((name, bb)) => {
-                eprintln!("[2/4] Reusing existing bbox column `{name}` from input");
-                let kinds = compute_kinds(&table, geom_col_idx)?;
-                (bb, kinds, Some(name))
-            }
-            None => {
-                eprintln!("[2/4] Computing per-feature bbox from WKB");
-                let pairs = compute_bboxes_and_kinds(&table, geom_col_idx)?;
-                let (bb, kinds): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-                (bb, kinds, None)
-            }
-        };
+    let sort_key_idx = match &args.sort_key {
+        Some(name) => Some(
+            input_schema
+                .index_of(name)
+                .with_context(|| format!("--sort-key column `{name}` not found"))?,
+        ),
+        None => None,
+    };
 
-    let sort_ranks = compute_sort_ranks(&table, args.sort_key.as_deref(), args.sort_order)?;
+    let covering = covering_plan(&input_schema, input_geo.as_ref(), &geom_col_name);
+    match &covering {
+        Some(p) => eprintln!(
+            "[2/4] Scanning geometry (reusing existing bbox column `{}`)",
+            p.col_name
+        ),
+        None => eprintln!("[2/4] Scanning geometry (computing per-feature bbox from WKB)"),
+    }
+    // Pass 1: stream only the geometry (+ covering bbox / sort-key) columns.
+    // Everything retained per row is O(1)-sized (bbox, kind, rank), so memory
+    // stays bounded by the row count, not by the file's attribute payload.
+    let ScanResult { bboxes, kinds, sort_key } = scan_input(
+        &args.input,
+        &arrow_meta,
+        geom_col_idx,
+        covering.as_ref(),
+        sort_key_idx,
+    )?;
+    let existing_bbox_col: Option<String> = covering.map(|p| p.col_name);
+
+    let sort_ranks = match &sort_key {
+        Some(col) => compute_sort_ranks(col.as_ref(), args.sort_order)
+            .with_context(|| format!("ranking --sort-key column `{:?}`", args.sort_key))?,
+        None => vec![0u64; n_rows],
+    };
+    drop(sort_key);
     if let Some(col) = &args.sort_key {
         eprintln!(
             "      tie-break sort key: {col} ({})",
@@ -505,8 +520,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     output_fields.push(Arc::new(bbox_struct_field()));
     let output_schema = Arc::new(Schema::new(output_fields));
 
-    let bbox_struct = build_bbox_struct(&bboxes)?;
-
     let dataset_bbox = bboxes
         .par_iter()
         .fold(Bbox::empty, |mut acc, b| {
@@ -536,29 +549,51 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .with_context(|| format!("creating {}", args.output.display()))?;
     let mut writer = ArrowWriter::try_new(out_file, output_schema.clone(), Some(props))?;
 
-    // Background thread builds RecordBatches (`take` per column is non-trivial
-    // for wide tables) while the main thread flushes the previous batch through
-    // the parquet writer. Capacity 2 overlaps I/O without unbounded buffering.
+    // Pass 2: a background thread gathers output chunks straight from the
+    // input file (row-selection read + interleave into output order) while the
+    // main thread flushes finished batches through the parquet writer. Chunks
+    // are independent, so the producer gathers them in rayon-parallel waves of
+    // one chunk per worker; each wave is sent in order once complete. Resident
+    // memory is bounded by one wave of `row_group_size`-row chunks plus the
+    // channel, never the whole table. The barrier per wave costs little
+    // because chunks are equal-sized and similarly priced.
     let (tx, rx) = sync_channel::<(usize, RecordBatch)>(2);
     let producer_schema = output_schema.clone();
-    let producer_table = Arc::new(table);
-    let producer_bbox = Arc::new(bbox_struct);
-    let producer_keep = keep_col_indices.clone();
-    let producer_per_level = per_level.clone();
+    let producer_bboxes = Arc::new(bboxes);
+    let producer_meta = arrow_meta.clone();
+    let producer_input = args.input.clone();
+    let producer_keep = keep_col_indices;
+    let producer_per_level = per_level;
     let producer_row_group_size = args.row_group_size;
     let producer = thread::spawn(move || -> Result<()> {
-        for (level_i, rows) in producer_per_level.iter().enumerate() {
-            for chunk in rows.chunks(producer_row_group_size) {
-                let indices = UInt32Array::from(chunk.to_vec());
-                let mut cols: Vec<ArrayRef> = Vec::with_capacity(producer_schema.fields().len());
-                for ki in &producer_keep {
-                    cols.push(take(producer_table.column(*ki).as_ref(), &indices, None)?);
-                }
-                let bbox_arr: ArrayRef = Arc::new((*producer_bbox).clone());
-                cols.push(take(bbox_arr.as_ref(), &indices, None)?);
-                let batch = RecordBatch::try_new(producer_schema.clone(), cols)?;
-                if tx.send((level_i, batch)).is_err() {
-                    return Ok(());
+        let chunks: Vec<(usize, &[u32])> = producer_per_level
+            .iter()
+            .enumerate()
+            .flat_map(|(level_i, rows)| {
+                rows.chunks(producer_row_group_size)
+                    .map(move |chunk| (level_i, chunk))
+            })
+            .collect();
+        for wave in chunks.chunks(rayon::current_num_threads()) {
+            let gathered = wave
+                .par_iter()
+                .map(|(level_i, chunk)| {
+                    let batches = gather_chunk(
+                        &producer_input,
+                        &producer_meta,
+                        &producer_keep,
+                        chunk,
+                        &producer_bboxes,
+                        &producer_schema,
+                    )?;
+                    Ok((*level_i, batches))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (level_i, batches) in gathered {
+                for batch in batches {
+                    if tx.send((level_i, batch)).is_err() {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -702,80 +737,273 @@ fn build_bbox_struct(bboxes: &[Bbox]) -> Result<StructArray> {
     )?)
 }
 
-/// Promote every top-level `Binary`/`Utf8` column whose accumulated bytes
-/// across batches would overflow i32 offsets during `concat_batches` to its
-/// `Large` counterpart (i64 offsets). Each batch is cast independently — the
-/// per-batch arrays were just produced by the parquet reader, so they are
-/// already within the i32 budget; the overflow only manifests when arrow tries
-/// to combine them. A 1 GiB per-column threshold leaves headroom for arrow's
-/// internal rounding and keeps small datasets on the cheaper i32 path.
-fn upcast_large_offsets_if_needed(
-    batches: Vec<RecordBatch>,
-    schema: Arc<Schema>,
-) -> Result<(Vec<RecordBatch>, Arc<Schema>)> {
-    const PROMOTE_THRESHOLD: usize = 1 << 30;
+/// Resolved GeoParquet 1.1 `covering.bbox` reference: the top-level struct
+/// column and child field names to read per-row bboxes from. Validated
+/// against the schema (top-level Float64 struct children) so the scan can
+/// downcast without re-checking per batch.
+struct CoveringPlan {
+    col_name: String,
+    col_idx: usize,
+    xmin: String,
+    ymin: String,
+    xmax: String,
+    ymax: String,
+}
 
-    let mut promote: Vec<(usize, DataType)> = Vec::new();
-    for (i, field) in schema.fields().iter().enumerate() {
-        let large = match field.data_type() {
-            DataType::Binary => DataType::LargeBinary,
-            DataType::Utf8 => DataType::LargeUtf8,
-            _ => continue,
-        };
-        let total: usize = batches
-            .iter()
-            .map(|b| {
-                let arr = b.column(i);
-                match arr.data_type() {
-                    DataType::Binary => arr
-                        .as_any()
-                        .downcast_ref::<BinaryArray>()
-                        .map(|a| a.value_data().len())
-                        .unwrap_or(0),
-                    DataType::Utf8 => arr
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .map(|a| a.value_data().len())
-                        .unwrap_or(0),
-                    _ => 0,
-                }
-            })
-            .sum();
-        if total >= PROMOTE_THRESHOLD {
-            eprintln!(
-                "      column `{}` is {} bytes — upcasting {:?} → {:?} to avoid i32 offset overflow",
-                field.name(),
-                total,
-                field.data_type(),
-                large,
-            );
-            promote.push((i, large));
+fn covering_plan(
+    schema: &Schema,
+    input_geo: Option<&GeoMeta>,
+    geom_col: &str,
+) -> Option<CoveringPlan> {
+    let covering = input_geo?.columns.get(geom_col)?.covering.as_ref()?;
+    let b = &covering.bbox;
+    if b.xmin.len() != 2 || b.ymin.len() != 2 || b.xmax.len() != 2 || b.ymax.len() != 2 {
+        return None;
+    }
+    let col_name = &b.xmin[0];
+    if &b.ymin[0] != col_name || &b.xmax[0] != col_name || &b.ymax[0] != col_name {
+        return None;
+    }
+    let col_idx = schema.index_of(col_name).ok()?;
+    let DataType::Struct(children) = schema.field(col_idx).data_type() else {
+        return None;
+    };
+    for child in [&b.xmin[1], &b.ymin[1], &b.xmax[1], &b.ymax[1]] {
+        match children.iter().find(|f| f.name() == child) {
+            Some(f) if f.data_type() == &DataType::Float64 => {}
+            _ => return None,
         }
     }
-    if promote.is_empty() {
-        return Ok((batches, schema));
-    }
-    let mut new_fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
-    for (idx, large) in &promote {
-        let old = &new_fields[*idx];
-        new_fields[*idx] = Field::new(old.name(), large.clone(), old.is_nullable())
-            .with_metadata(old.metadata().clone());
-    }
-    let new_schema = Arc::new(Schema::new_with_metadata(
-        new_fields,
-        schema.metadata().clone(),
-    ));
-    let new_batches = batches
-        .into_iter()
-        .map(|b| -> Result<RecordBatch> {
-            let mut cols: Vec<ArrayRef> = b.columns().to_vec();
-            for (idx, large) in &promote {
-                cols[*idx] = cast(cols[*idx].as_ref(), large)?;
-            }
-            Ok(RecordBatch::try_new(new_schema.clone(), cols)?)
+    Some(CoveringPlan {
+        col_name: col_name.clone(),
+        col_idx,
+        xmin: b.xmin[1].clone(),
+        ymin: b.ymin[1].clone(),
+        xmax: b.xmax[1].clone(),
+        ymax: b.ymax[1].clone(),
+    })
+}
+
+/// Borrowed covering-column accessors for one batch. `value` returns `None`
+/// when the struct or any child is null at that row, letting the caller fall
+/// back to the row's WKB — a partially-null covering column degrades per row
+/// instead of disabling reuse for the whole file.
+struct CoverCols<'a> {
+    parent: &'a StructArray,
+    xmin: &'a Float64Array,
+    ymin: &'a Float64Array,
+    xmax: &'a Float64Array,
+    ymax: &'a Float64Array,
+}
+
+impl<'a> CoverCols<'a> {
+    fn from_batch(batch: &'a RecordBatch, col: usize, plan: &CoveringPlan) -> Result<Self> {
+        let parent = batch
+            .column(col)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| anyhow!("covering column `{}` is not a struct", plan.col_name))?;
+        let get = |name: &str| -> Result<&'a Float64Array> {
+            parent
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+                .ok_or_else(|| {
+                    anyhow!("covering child `{}.{name}` is not Float64", plan.col_name)
+                })
+        };
+        Ok(Self {
+            parent,
+            xmin: get(&plan.xmin)?,
+            ymin: get(&plan.ymin)?,
+            xmax: get(&plan.xmax)?,
+            ymax: get(&plan.ymax)?,
         })
-        .collect::<Result<Vec<_>>>()?;
-    Ok((new_batches, new_schema))
+    }
+
+    fn value(&self, i: usize) -> Option<Bbox> {
+        if self.parent.is_null(i)
+            || self.xmin.is_null(i)
+            || self.ymin.is_null(i)
+            || self.xmax.is_null(i)
+            || self.ymax.is_null(i)
+        {
+            return None;
+        }
+        Some(Bbox {
+            xmin: self.xmin.value(i),
+            ymin: self.ymin.value(i),
+            xmax: self.xmax.value(i),
+            ymax: self.ymax.value(i),
+        })
+    }
+}
+
+struct ScanResult {
+    bboxes: Vec<Bbox>,
+    kinds: Vec<GeomKind>,
+    /// The fully materialized `--sort-key` column, when one was requested —
+    /// the only column the convert still holds in memory in its entirety.
+    sort_key: Option<ArrayRef>,
+}
+
+/// Pass 1: stream the file reading only the geometry column (plus, when
+/// present, the covering bbox column and the `--sort-key` column) and reduce
+/// each row to its bbox + geometry kind. Batches are dropped as soon as they
+/// are consumed, so peak memory is one batch plus the per-row outputs.
+fn scan_input(
+    input: &Path,
+    meta: &ArrowReaderMetadata,
+    geom_col_idx: usize,
+    covering: Option<&CoveringPlan>,
+    sort_key_idx: Option<usize>,
+) -> Result<ScanResult> {
+    let mut roots: Vec<usize> = vec![geom_col_idx];
+    if let Some(p) = covering {
+        roots.push(p.col_idx);
+    }
+    if let Some(i) = sort_key_idx {
+        roots.push(i);
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    // Projected batches keep the schema's field order, so a column's index in
+    // the batch is its rank within the sorted projection roots.
+    let proj_idx = |orig: usize| roots.iter().position(|r| *r == orig).unwrap();
+
+    let file = File::open(input).with_context(|| format!("opening {}", input.display()))?;
+    let mask = ProjectionMask::roots(
+        meta.metadata().file_metadata().schema_descr(),
+        roots.iter().copied(),
+    );
+    // Only 1-3 narrow columns are projected, so large batches are cheap and
+    // keep the per-batch rayon fan-out (WKB parsing) coarse enough that
+    // fork/join overhead stays negligible next to the parse work.
+    const SCAN_BATCH_ROWS: usize = 64 * 1024;
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta.clone())
+        .with_projection(mask)
+        .with_batch_size(SCAN_BATCH_ROWS)
+        .build()?;
+
+    let n_rows = meta.metadata().file_metadata().num_rows() as usize;
+    let mut bboxes: Vec<Bbox> = Vec::with_capacity(n_rows);
+    let mut kinds: Vec<GeomKind> = Vec::with_capacity(n_rows);
+    let mut sort_key_parts: Vec<ArrayRef> = Vec::new();
+    let mut row_base = 0usize;
+    for batch in reader {
+        let batch = batch?;
+        let cover = match covering {
+            Some(p) => Some(CoverCols::from_batch(&batch, proj_idx(p.col_idx), p)?),
+            None => None,
+        };
+        let pairs = scan_geometry_batch(
+            batch.column(proj_idx(geom_col_idx)).as_ref(),
+            cover.as_ref(),
+            row_base,
+        )?;
+        for (bb, k) in pairs {
+            bboxes.push(bb);
+            kinds.push(k);
+        }
+        if let Some(i) = sort_key_idx {
+            sort_key_parts.push(batch.column(proj_idx(i)).clone());
+        }
+        row_base += batch.num_rows();
+    }
+    let sort_key = match sort_key_idx {
+        Some(_) => Some(concat_sort_key(&sort_key_parts)?),
+        None => None,
+    };
+    Ok(ScanResult { bboxes, kinds, sort_key })
+}
+
+fn scan_geometry_batch(
+    geom: &dyn Array,
+    cover: Option<&CoverCols>,
+    row_base: usize,
+) -> Result<Vec<(Bbox, GeomKind)>> {
+    if let Some(arr) = geom.as_any().downcast_ref::<BinaryArray>() {
+        scan_wkb_rows(arr, cover, row_base)
+    } else if let Some(arr) = geom.as_any().downcast_ref::<LargeBinaryArray>() {
+        scan_wkb_rows(arr, cover, row_base)
+    } else {
+        bail!(
+            "geometry column has unsupported type `{:?}`; only WKB Binary/LargeBinary is supported",
+            geom.data_type()
+        );
+    }
+}
+
+fn scan_wkb_rows<O: OffsetSizeTrait>(
+    arr: &GenericBinaryArray<O>,
+    cover: Option<&CoverCols>,
+    row_base: usize,
+) -> Result<Vec<(Bbox, GeomKind)>> {
+    (0..arr.len())
+        .into_par_iter()
+        .map(|i| {
+            if arr.is_null(i) {
+                bail!("null geometry at row {}", row_base + i);
+            }
+            let wkb = arr.value(i);
+            if let Some(c) = cover {
+                if let Some(bb) = c.value(i) {
+                    return Ok((bb, kind_from_wkb(wkb)?));
+                }
+            }
+            bbox_from_wkb(wkb)
+        })
+        .collect()
+}
+
+/// Concatenate the per-batch sort-key arrays into one column for `rank`.
+/// A variable-width column whose accumulated bytes would overflow i32 offsets
+/// (arrow panics past ~2 GiB) is upcast to its Large counterpart first; the
+/// 1 GiB threshold leaves headroom and keeps small columns on the i32 path.
+fn concat_sort_key(parts: &[ArrayRef]) -> Result<ArrayRef> {
+    const PROMOTE_THRESHOLD: usize = 1 << 30;
+    match parts {
+        [] => bail!("internal: sort-key scan produced no batches"),
+        [only] => return Ok(only.clone()),
+        _ => {}
+    }
+    let large = match parts[0].data_type() {
+        DataType::Binary => Some(DataType::LargeBinary),
+        DataType::Utf8 => Some(DataType::LargeUtf8),
+        _ => None,
+    };
+    let total: usize = parts.iter().map(|p| var_width_total(p.as_ref())).sum();
+    let parts: Vec<ArrayRef> = match large {
+        Some(large) if total >= PROMOTE_THRESHOLD => parts
+            .iter()
+            .map(|p| Ok(cast(p.as_ref(), &large)?))
+            .collect::<Result<_>>()?,
+        _ => parts.to_vec(),
+    };
+    let refs: Vec<&dyn Array> = parts.iter().map(|p| p.as_ref()).collect();
+    Ok(concat(&refs)?)
+}
+
+fn var_width_total(arr: &dyn Array) -> usize {
+    match arr.data_type() {
+        DataType::Binary => arr
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .map(|a| a.value_data().len()),
+        DataType::LargeBinary => arr
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .map(|a| a.value_data().len()),
+        DataType::Utf8 => arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| a.value_data().len()),
+        DataType::LargeUtf8 => arr
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|a| a.value_data().len()),
+        _ => None,
+    }
+    .unwrap_or(0)
 }
 
 fn guess_geometry_column(schema: &Schema) -> Option<String> {
@@ -795,118 +1023,151 @@ fn guess_geometry_column(schema: &Schema) -> Option<String> {
     None
 }
 
-/// If the input declares a bbox covering column (GeoParquet 1.1 `covering.bbox`),
-/// read the per-row bboxes directly from it instead of recomputing from WKB.
-/// Returns `None` if the metadata is missing, the referenced column is not a
-/// top-level Float64 struct with the expected children, or any value is null.
-fn read_existing_bboxes(
-    table: &RecordBatch,
-    input_geo: Option<&GeoMeta>,
-    geom_col: &str,
-) -> Option<(String, Vec<Bbox>)> {
-    let covering = input_geo?.columns.get(geom_col)?.covering.as_ref()?;
-    let b = &covering.bbox;
-    if b.xmin.len() != 2 || b.ymin.len() != 2 || b.xmax.len() != 2 || b.ymax.len() != 2 {
-        return None;
-    }
-    let col_name = &b.xmin[0];
-    if &b.ymin[0] != col_name || &b.xmax[0] != col_name || &b.ymax[0] != col_name {
-        return None;
-    }
-    let col_idx = table.schema().index_of(col_name).ok()?;
-    let struct_arr = table
-        .column(col_idx)
-        .as_any()
-        .downcast_ref::<StructArray>()?;
-    let get = |name: &str| -> Option<&Float64Array> {
-        struct_arr
-            .column_by_name(name)?
+/// Per-row byte contribution to variable-width output arrays; used to split a
+/// gathered chunk so no interleaved output column can overflow i32 offsets.
+fn var_width_bytes_at(arr: &dyn Array, i: usize) -> usize {
+    match arr.data_type() {
+        DataType::Binary => arr
             .as_any()
-            .downcast_ref::<Float64Array>()
-    };
-    let xmin = get(&b.xmin[1])?;
-    let ymin = get(&b.ymin[1])?;
-    let xmax = get(&b.xmax[1])?;
-    let ymax = get(&b.ymax[1])?;
-    let n = table.num_rows();
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        if xmin.is_null(i) || ymin.is_null(i) || xmax.is_null(i) || ymax.is_null(i) {
-            return None;
+            .downcast_ref::<BinaryArray>()
+            .map(|a| a.value_length(i) as usize),
+        DataType::LargeBinary => arr
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .map(|a| a.value_length(i) as usize),
+        DataType::Utf8 => arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| a.value_length(i) as usize),
+        DataType::LargeUtf8 => arr
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|a| a.value_length(i) as usize),
+        _ => None,
+    }
+    .unwrap_or(0)
+}
+
+/// Cap on the summed variable-width bytes per interleaved output batch. The
+/// sum across columns bounds each single column, so staying under 1 GiB keeps
+/// every i32-offset column comfortably below arrow's ~2 GiB overflow point.
+const SEGMENT_MAX_BYTES: usize = 1 << 30;
+
+/// Skip/select run-length selection over the whole file for the given
+/// ascending, duplicate-free row indices.
+fn row_selection_for(sorted: &[u32]) -> RowSelection {
+    let mut selectors: Vec<RowSelector> = Vec::new();
+    let mut cursor = 0usize;
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = sorted[i] as usize;
+        let mut end = start + 1;
+        i += 1;
+        while i < sorted.len() && sorted[i] as usize == end {
+            end += 1;
+            i += 1;
         }
-        out.push(Bbox {
-            xmin: xmin.value(i),
-            ymin: ymin.value(i),
-            xmax: xmax.value(i),
-            ymax: ymax.value(i),
-        });
+        if start > cursor {
+            selectors.push(RowSelector::skip(start - cursor));
+        }
+        selectors.push(RowSelector::select(end - start));
+        cursor = end;
     }
-    Some((col_name.clone(), out))
+    RowSelection::from(selectors)
 }
 
-fn compute_bboxes_and_kinds(
-    table: &RecordBatch,
-    geom_col_idx: usize,
-) -> Result<Vec<(Bbox, GeomKind)>> {
-    let col = table.column(geom_col_idx);
-    let n = col.len();
-    if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
-        (0..n)
-            .into_par_iter()
-            .map(|i| {
-                if arr.is_null(i) {
-                    bail!("null geometry at row {i}");
-                }
-                bbox_from_wkb(arr.value(i))
-            })
-            .collect()
-    } else if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
-        (0..n)
-            .into_par_iter()
-            .map(|i| {
-                if arr.is_null(i) {
-                    bail!("null geometry at row {i}");
-                }
-                bbox_from_wkb(arr.value(i))
-            })
-            .collect()
-    } else {
-        bail!(
-            "geometry column has unsupported type `{:?}`; only WKB Binary/LargeBinary is supported",
-            col.data_type()
-        );
-    }
-}
+/// Pass 2 gather: read exactly `chunk`'s rows from the input via a parquet
+/// row selection, interleave them into the chunk's (STR-packed) output order,
+/// and append the bbox struct built from the already-computed `bboxes`.
+/// Returns one batch normally; the chunk is split into several whenever its
+/// variable-width payload approaches the i32 offset budget (see
+/// `SEGMENT_MAX_BYTES`), so arbitrarily fat rows cannot overflow.
+fn gather_chunk(
+    input: &Path,
+    meta: &ArrowReaderMetadata,
+    keep_cols: &[usize],
+    chunk: &[u32],
+    bboxes: &[Bbox],
+    output_schema: &Arc<Schema>,
+) -> Result<Vec<RecordBatch>> {
+    let mut sorted = chunk.to_vec();
+    sorted.sort_unstable();
 
-fn compute_kinds(table: &RecordBatch, geom_col_idx: usize) -> Result<Vec<GeomKind>> {
-    let col = table.column(geom_col_idx);
-    let n = col.len();
-    if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
-        (0..n)
-            .into_par_iter()
-            .map(|i| {
-                if arr.is_null(i) {
-                    bail!("null geometry at row {i}");
-                }
-                kind_from_wkb(arr.value(i))
-            })
-            .collect()
-    } else if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
-        (0..n)
-            .into_par_iter()
-            .map(|i| {
-                if arr.is_null(i) {
-                    bail!("null geometry at row {i}");
-                }
-                kind_from_wkb(arr.value(i))
-            })
-            .collect()
-    } else {
+    let file = File::open(input).with_context(|| format!("opening {}", input.display()))?;
+    let mask = ProjectionMask::roots(
+        meta.metadata().file_metadata().schema_descr(),
+        keep_cols.iter().copied(),
+    );
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta.clone())
+        .with_projection(mask)
+        .with_row_selection(row_selection_for(&sorted))
+        .build()?;
+    let mut batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
+    batches.retain(|b| b.num_rows() > 0);
+    let gathered: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if gathered != sorted.len() {
         bail!(
-            "geometry column has unsupported type `{:?}`; only WKB Binary/LargeBinary is supported",
-            col.data_type()
+            "internal: row selection returned {gathered} rows, expected {}",
+            sorted.len()
         );
     }
+
+    // Selected rows arrive in ascending input-row order; map each output
+    // position back to (batch, row-in-batch) through the sorted index list.
+    let mut starts = Vec::with_capacity(batches.len());
+    let mut acc = 0usize;
+    for b in &batches {
+        starts.push(acc);
+        acc += b.num_rows();
+    }
+    let locs: Vec<(usize, usize)> = chunk
+        .iter()
+        .map(|r| {
+            let p = sorted
+                .binary_search(r)
+                .expect("chunk row missing from its own sorted copy");
+            let b = starts.partition_point(|s| *s <= p) - 1;
+            (b, p - starts[b])
+        })
+        .collect();
+
+    let n_cols = keep_cols.len();
+    let col_refs: Vec<Vec<&dyn Array>> = (0..n_cols)
+        .map(|c| batches.iter().map(|b| b.column(c).as_ref()).collect())
+        .collect();
+    let weights: Vec<usize> = locs
+        .iter()
+        .map(|(b, i)| {
+            batches[*b]
+                .columns()
+                .iter()
+                .map(|col| var_width_bytes_at(col.as_ref(), *i))
+                .sum()
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    let mut seg_start = 0usize;
+    while seg_start < chunk.len() {
+        let mut seg_end = seg_start + 1;
+        let mut seg_bytes = weights[seg_start];
+        while seg_end < chunk.len() && seg_bytes + weights[seg_end] <= SEGMENT_MAX_BYTES {
+            seg_bytes += weights[seg_end];
+            seg_end += 1;
+        }
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_cols + 1);
+        for refs in &col_refs {
+            cols.push(interleave(refs, &locs[seg_start..seg_end])?);
+        }
+        let seg_bboxes: Vec<Bbox> = chunk[seg_start..seg_end]
+            .iter()
+            .map(|r| bboxes[*r as usize])
+            .collect();
+        cols.push(Arc::new(build_bbox_struct(&seg_bboxes)?));
+        out.push(RecordBatch::try_new(output_schema.clone(), cols)?);
+        seg_start = seg_end;
+    }
+    Ok(out)
 }
 
 /// Per-kind multipliers on `prec` for the level thinning grid pitch.
@@ -930,27 +1191,14 @@ struct VisibilityFactors {
 /// larger rank means higher priority within a thinning cell (see `priority`).
 /// Equal column values share a rank, so ties still fall through to the hashed
 /// row index; null values rank below every non-null and so always lose.
-/// Returns all-zero ranks when no key is given, leaving `priority` unchanged.
-fn compute_sort_ranks(
-    table: &RecordBatch,
-    sort_key: Option<&str>,
-    order: SortKeyOrder,
-) -> Result<Vec<u64>> {
-    let Some(col_name) = sort_key else {
-        return Ok(vec![0u64; table.num_rows()]);
-    };
-    let idx = table
-        .schema()
-        .index_of(col_name)
-        .with_context(|| format!("--sort-key column `{col_name}` not found"))?;
+fn compute_sort_ranks(col: &dyn Array, order: SortKeyOrder) -> Result<Vec<u64>> {
     // nulls_first keeps nulls at the lowest rank in both directions; `descending`
     // only flips which end of the value range earns the highest (winning) rank.
     let opts = SortOptions {
         descending: matches!(order, SortKeyOrder::Asc),
         nulls_first: true,
     };
-    let ranks = rank(table.column(idx).as_ref(), Some(opts))
-        .with_context(|| format!("ranking --sort-key column `{col_name}`"))?;
+    let ranks = rank(col, Some(opts))?;
     Ok(ranks.into_iter().map(u64::from).collect())
 }
 
@@ -1484,26 +1732,33 @@ mod tests {
     #[test]
     fn compute_sort_ranks_orders_by_value_and_sinks_nulls() {
         use arrow::array::Int32Array;
-        let col = Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(20)])) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![Field::new("score", DataType::Int32, true)]));
-        let table = RecordBatch::try_new(schema, vec![col]).unwrap();
+        let col = Int32Array::from(vec![Some(10), None, Some(30), Some(20)]);
 
         // desc → largest value gets the highest rank, null the lowest.
-        let desc = compute_sort_ranks(&table, Some("score"), SortKeyOrder::Desc).unwrap();
+        let desc = compute_sort_ranks(&col, SortKeyOrder::Desc).unwrap();
         assert!(desc[2] > desc[3] && desc[3] > desc[0] && desc[0] > desc[1]);
 
         // asc → smallest value gets the highest rank, null still lowest.
-        let asc = compute_sort_ranks(&table, Some("score"), SortKeyOrder::Asc).unwrap();
+        let asc = compute_sort_ranks(&col, SortKeyOrder::Asc).unwrap();
         assert!(asc[0] > asc[3] && asc[3] > asc[2] && asc[2] > asc[1]);
+    }
 
-        // No key → all zeros (priority unaffected).
-        assert_eq!(
-            compute_sort_ranks(&table, None, SortKeyOrder::Desc).unwrap(),
-            vec![0, 0, 0, 0]
-        );
+    #[test]
+    fn row_selection_for_builds_skip_select_runs() {
+        let sel = row_selection_for(&[0, 1, 2, 5, 6, 9]);
+        let expected = RowSelection::from(vec![
+            RowSelector::select(3),
+            RowSelector::skip(2),
+            RowSelector::select(2),
+            RowSelector::skip(2),
+            RowSelector::select(1),
+        ]);
+        assert_eq!(sel, expected);
 
-        // Unknown column → error.
-        assert!(compute_sort_ranks(&table, Some("missing"), SortKeyOrder::Desc).is_err());
+        // Leading skip when the first selected row is not row 0.
+        let sel = row_selection_for(&[3, 4]);
+        let expected = RowSelection::from(vec![RowSelector::skip(3), RowSelector::select(2)]);
+        assert_eq!(sel, expected);
     }
 
     #[test]
