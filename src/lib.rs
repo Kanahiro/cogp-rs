@@ -1,3 +1,4 @@
+#[cfg(feature = "cli")]
 pub mod convert;
 pub mod meta;
 pub mod reader;
