@@ -1,3 +1,5 @@
+[UNMAINTAINED] merged into https://github.com/Kanahiro/cloud-optimized-geoparquet
+
 # cogp
 
 Rust reference CLI for the [Cloud Optimized GeoParquet Profile (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet).
